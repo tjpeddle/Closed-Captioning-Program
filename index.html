@@ -944,11 +944,14 @@ async function toBlobURL(url,type){
   if(!r.ok) throw new Error('Could not download the video toolkit ('+url.split('/').pop()+').');
   return URL.createObjectURL(new Blob([await r.arrayBuffer()],{type}));
 }
+let FFFS=null;
 async function getFFmpeg(onMsg){
   if(ffmpegInst) return ffmpegInst;
   onMsg('Downloading the video toolkit (one time, ~32 MB — cached afterwards)…');
   const abs=new URL(FF_BASE.ffmpeg, location.href).href.replace(/\/$/,'');
-  const {FFmpeg}=await import(abs+'/index.js');
+  const mod=await import(abs+'/index.js');
+  const {FFmpeg}=mod;
+  try{ FFFS=(await import(abs+'/types.js')).FFFSType; }catch(_){ FFFS={WORKERFS:'WORKERFS'}; }
   const ff=new FFmpeg();
   // A worker cannot be constructed straight from another origin, so wrap the
   // real worker in a tiny same-origin module that imports it. Its own relative
@@ -964,7 +967,7 @@ async function getFFmpeg(onMsg){
   return ff;
 }
 const mp4Status=$('mp4Status');
-let muxBusy=false;
+let muxBusy=false, skipPicker=false;
 $('dlMp4').addEventListener('click',async ()=>{
   if(muxBusy) return;
   if(!current || !current.cues || !current.cues.filter(c=>c.text.trim()).length){
@@ -976,16 +979,51 @@ $('dlMp4').addEventListener('click',async ()=>{
     mp4Status.textContent='This file is audio-only — there is no video to package. Use the .srt or transcript instead.';
     return;
   }
-  if(f.size>700*1048576){
-    mp4Status.textContent='This video is too large to repackage in the browser (limit ~700 MB). Use the .srt file next to the video instead — VLC picks it up automatically when both share a name.';
+  const mb=f.size/1048576;
+  if(mb>2400){
+    mp4Status.textContent='At '+Math.round(mb)+' MB this video is beyond what any browser can repackage. Share the .srt next to the video instead — name them the same (lecture.mp4 + lecture.srt) and VLC loads the captions automatically. Or shrink the video in HandBrake first, then come back.';
     return;
   }
+
+  // For big files, ask where to save BEFORE the long work: it needs a fresh
+  // click, and writing straight to disk avoids holding another whole copy in
+  // memory. Small files just download normally — no dialog to dismiss.
+  let handle=null;
+  if(mb>400 && window.showSaveFilePicker && !skipPicker){
+    try{
+      handle=await window.showSaveFilePicker({
+        suggestedName:nameFor(f)+'-captioned.mp4',
+        types:[{description:'Video',accept:{'video/mp4':['.mp4'],'video/x-matroska':['.mkv']}}]
+      });
+    }catch(err){
+      // Cancelled, blocked by policy, or unsupported — never dead-end here.
+      skipPicker=true;
+      mp4Status.textContent='No save location chosen. Press the button once more and it will save to your Downloads folder instead.';
+      return;
+    }
+  }
+
   muxBusy=true; $('dlMp4').disabled=true;
   try{
     const ff=await getFFmpeg(m=>mp4Status.textContent=m);
-    mp4Status.textContent='Packaging '+f.name+' with its captions… (no re-encoding — usually well under a minute)';
-    const inName='in_'+f.name.replace(/[^A-Za-z0-9._-]/g,'_');
-    await ff.writeFile(inName, new Uint8Array(await f.arrayBuffer()));
+    const big=mb>700;
+    mp4Status.textContent='Packaging '+f.name+' with its captions… (no re-encoding'+
+      (big?' — a video this size can take a few minutes and needs plenty of free memory':' — usually well under a minute')+')';
+
+    // Mount the file rather than copying it into memory: ffmpeg reads it
+    // straight off disk, which is what makes large videos possible at all.
+    let inName=null, mounted=false;
+    try{
+      try{ await ff.createDir('/src'); }catch(_){}
+      await ff.mount(FFFS.WORKERFS,{files:[f]},'/src');
+      mounted=true;
+      inName='/src/'+f.name;
+    }catch(err){
+      console.warn('WORKERFS mount unavailable, copying instead',err);
+      if(mb>700) throw new Error('too-big-nomount');
+      inName='in_'+f.name.replace(/[^A-Za-z0-9._-]/g,'_');
+      await ff.writeFile(inName,new Uint8Array(await f.arrayBuffer()));
+    }
     await ff.writeFile('caps.srt', new TextEncoder().encode(toSRT(current.cues)));
     // MP4 first; VP8/VP9/Opus sources (.webm) cannot go in an MP4 without
     // re-encoding, so fall back to MKV, which takes any codec and plays in VLC.
@@ -999,20 +1037,35 @@ $('dlMp4').addEventListener('click',async ()=>{
       code=await ff.exec(['-i',inName,'-i','caps.srt',...common,'-c:s','srt',outName]);
     }
     if(code!==0) throw new Error('remux failed');
+    mp4Status.textContent='Saving the file…';
     const data=await ff.readFile(outName);
-    const blob=new Blob([data.buffer],{type:mime});
-    const a=document.createElement('a');
-    a.href=URL.createObjectURL(blob);
-    a.download=nameFor(f)+'-captioned'+ext;
-    document.body.appendChild(a); a.click();
-    setTimeout(()=>{URL.revokeObjectURL(a.href);a.remove();},1500);
-    mp4Status.textContent='Done — '+nameFor(f)+'-captioned'+ext+' is in your downloads. Captions are on by default in VLC; other players show them under the subtitle or CC menu.';
-    try{ await ff.deleteFile(inName); await ff.deleteFile('caps.srt'); await ff.deleteFile(outName); }catch(_){}
+    let where;
+    if(handle){
+      const w=await handle.createWritable();
+      await w.write(data);
+      await w.close();
+      where='saved where you chose';
+    }else{
+      const a=document.createElement('a');
+      a.href=URL.createObjectURL(new Blob([data.buffer],{type:mime}));
+      a.download=nameFor(f)+'-captioned'+ext;
+      document.body.appendChild(a); a.click();
+      setTimeout(()=>{URL.revokeObjectURL(a.href);a.remove();},1500);
+      where='in your downloads';
+    }
+    mp4Status.textContent='Done — '+nameFor(f)+'-captioned'+ext+' is '+where+
+      '. Captions are on by default in VLC; other players show them under the subtitle or CC menu.';
+    try{ await ff.deleteFile('caps.srt'); await ff.deleteFile(outName); }catch(_){}
+    if(mounted){ try{ await ff.unmount('/src'); }catch(_){} }
+    else { try{ await ff.deleteFile(inName); }catch(_){} }
   }catch(err){
     console.error(err);
-    mp4Status.textContent=(err&&err.message&&err.message.startsWith('Could not download'))
-      ? err.message
-      : 'This video’s format could not be repackaged as MP4 without re-encoding (common for .webm and some phone recordings). Convert it to MP4 (H.264/AAC) first, or share the .srt next to the video — VLC pairs them automatically when the names match.';
+    const m=(err&&err.message)||'';
+    const oom=/memory|allocat|OOM|Aborted/i.test(m)||m==='too-big-nomount';
+    mp4Status.textContent =
+      m.startsWith('Could not download') ? m :
+      oom ? 'This computer ran out of memory packaging a video this large. Two ways forward: share the .srt next to the video (name them the same — lecture.mp4 + lecture.srt — and VLC loads captions automatically), or shrink the video in HandBrake first and then repackage it here. Closing other browser tabs before retrying can also be enough.'
+          : 'This video’s format could not be repackaged without re-encoding. Convert it to MP4 (H.264/AAC) first, or share the .srt next to the video — VLC pairs them automatically when the names match.';
   }finally{
     muxBusy=false; $('dlMp4').disabled=false;
   }
