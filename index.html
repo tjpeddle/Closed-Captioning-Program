@@ -939,6 +939,15 @@ const FF_BASE = window.__FF_BASE || {
   core:'https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.10/dist/esm'
 };
 let ffmpegInst=null;
+const ffLog=[];
+// "Aborted()" is emscripten's ordinary exit line and shows up on successful
+// runs too — never treat it as a diagnosis.
+const NOISE=/^\s*Aborted\(\)\s*$/;
+function ffReason(){
+  const bad=ffLog.filter(l=>!NOISE.test(l) &&
+    /Error|Invalid|Unable|Could not|Unsupported|No space|out of memory|Cannot enlarge|does not contain|incompatible/i.test(l));
+  return bad.length ? bad[bad.length-1].trim().slice(0,180) : '';
+}
 async function toBlobURL(url,type){
   const r=await fetch(url);
   if(!r.ok) throw new Error('Could not download the video toolkit ('+url.split('/').pop()+').');
@@ -953,6 +962,11 @@ async function getFFmpeg(onMsg){
   const {FFmpeg}=mod;
   try{ FFFS=(await import(abs+'/types.js')).FFFSType; }catch(_){ FFFS={WORKERFS:'WORKERFS'}; }
   const ff=new FFmpeg();
+  ff.on('log',({message})=>{
+    ffLog.push(message);
+    if(ffLog.length>400) ffLog.shift();
+    if(!NOISE.test(message) && /Error|Invalid|Unable|could not|No space|memory/i.test(message)) console.warn('[ffmpeg]',message);
+  });
   // A worker cannot be constructed straight from another origin, so wrap the
   // real worker in a tiny same-origin module that imports it. Its own relative
   // imports still resolve against the CDN, which is what we want.
@@ -1013,6 +1027,7 @@ $('dlMp4').addEventListener('click',async ()=>{
   }
 
   muxBusy=true; $('dlMp4').disabled=true;
+  let handleDropped=false;
   try{
     const ff=await getFFmpeg(m=>mp4Status.textContent=m);
     const big=mb>700;
@@ -1042,8 +1057,26 @@ $('dlMp4').addEventListener('click',async ()=>{
     // is worth it for web playback but needs a second full pass, so skip it on
     // large files where the memory cost is what breaks the export.
     const fast = (plan.ext==='.mp4' && mb<=500) ? ['-movflags','+faststart'] : [];
-    const code=await ff.exec(['-i',inName,'-i','caps.srt',...common,'-c:s',plan.sub,...fast,plan.out]);
-    if(code!==0) throw new Error('remux failed');
+    ffLog.length=0;
+    let code=await ff.exec(['-i',inName,'-i','caps.srt',...common,'-c:s',plan.sub,...fast,plan.out]);
+
+    // If MP4 packaging failed, MKV accepts practically any combination of
+    // streams. Switch the whole plan — including the file name — so the
+    // extension can never disagree with what is inside. A save location the
+    // user already picked is for a .mp4, so that file is delivered as a
+    // download instead of writing mismatched bytes into it.
+    if(code!==0 && plan.ext==='.mp4'){
+      console.warn('MP4 remux failed; ffmpeg said:', ffReason(), ffLog.slice(-25));
+      mp4Status.textContent='MP4 could not hold this video’s streams — repackaging as .mkv instead…';
+      ffLog.length=0;
+      plan.out='out.mkv'; plan.ext='.mkv'; plan.mime='video/x-matroska'; plan.sub='srt';
+      if(handle){ handle=null; handleDropped=true; }
+      code=await ff.exec(['-i',inName,'-i','caps.srt',...common,'-c:s',plan.sub,plan.out]);
+    }
+    if(code!==0){
+      console.warn('remux failed; ffmpeg log tail:', ffLog.slice(-30));
+      throw new Error('remux failed'+(ffReason()?': '+ffReason():''));
+    }
 
     mp4Status.textContent='Checking the packaged file…';
     const data=await ff.readFile(plan.out);
@@ -1073,7 +1106,8 @@ $('dlMp4').addEventListener('click',async ()=>{
       where='in your downloads';
     }
     mp4Status.textContent='Done — '+outFile+' is '+where+
-      (plan.ext==='.mkv'?'. This video’s format cannot go inside an MP4 without re-encoding, so it is packaged as .mkv — VLC plays it, Windows Media Player may not.':'')+
+      (plan.ext==='.mkv'?'. This video’s streams cannot go inside an MP4 without re-encoding, so it is packaged as .mkv — VLC plays it, Windows Media Player may not.':'')+
+      (handleDropped?' (It went to your Downloads folder rather than the location you picked, because that was named .mp4 and this file is .mkv.)':'')+
       ' Captions are on by default in VLC; other players show them under the subtitle or CC menu.';
     try{ await ff.deleteFile('caps.srt'); await ff.deleteFile(plan.out); }catch(_){}
     if(mounted){ try{ await ff.unmount('/src'); }catch(_){} }
@@ -1081,13 +1115,15 @@ $('dlMp4').addEventListener('click',async ()=>{
   }catch(err){
     console.error(err);
     const m=(err&&err.message)||'';
-    const oom=/memory|allocat|OOM|Aborted/i.test(m)||m==='too-big-nomount';
+    const reason=ffReason();
+    const oom=/out of memory|Cannot enlarge|allocat|OOM|No space/i.test(m+' '+reason)||m==='too-big-nomount';
     const bad=/unreadable|truncated|empty file/.test(m);
+    const sidecar=' Share the .srt next to the video instead — name them the same (lecture.mp4 + lecture.srt) and VLC loads the captions automatically.';
     mp4Status.textContent =
       m.startsWith('Could not download') ? m :
-      bad ? 'The packaged file came out damaged, so it was not saved — better than handing you a video that will not open. This usually means the computer ran short of memory on a video this large. Share the .srt next to the video instead (name them the same — lecture.mp4 + lecture.srt — and VLC loads the captions automatically), or shrink the video in HandBrake first and try again.' :
-      oom ? 'This computer ran out of memory packaging a video this large. Two ways forward: share the .srt next to the video (name them the same — lecture.mp4 + lecture.srt — and VLC loads captions automatically), or shrink the video in HandBrake first and then repackage it here. Closing other browser tabs before retrying can also be enough.'
-          : 'This video’s format could not be repackaged without re-encoding. Convert it to MP4 (H.264/AAC) first, or share the .srt next to the video — VLC pairs them automatically when the names match.';
+      bad ? 'The packaged file came out damaged, so it was not saved — better than handing you a video that will not open. This usually means the computer ran short of memory on a video this large.'+sidecar+' Shrinking the video in HandBrake first also works.' :
+      oom ? 'This computer ran out of memory packaging a video this large.'+sidecar+' Shrinking it in HandBrake first, or closing other browser tabs and retrying, can also be enough.'
+          : 'This video could not be repackaged.'+(reason?' ffmpeg reported: “'+reason+'”.':'')+sidecar+' (Full details are in the browser console — press F12, open Console, and copy anything in red.)';
   }finally{
     muxBusy=false; $('dlMp4').disabled=false;
   }
