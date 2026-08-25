@@ -1044,7 +1044,7 @@ $('dlMp4').addEventListener('click',async ()=>{
   $('diagWrap').hidden=true; $('diagNote').textContent='';
   let handleDropped=false;
   try{
-    const ff=await getFFmpeg(m=>mp4Status.textContent=m);
+    let ff=await getFFmpeg(m=>mp4Status.textContent=m);
     const big=mb>700;
     mp4Status.textContent='Packaging '+f.name+' with its captions… (no re-encoding'+
       (big?' — a video this size can take a few minutes and needs plenty of free memory':' — usually well under a minute')+')';
@@ -1066,6 +1066,15 @@ $('dlMp4').addEventListener('click',async ()=>{
     await ff.writeFile('caps.srt', new TextEncoder().encode(toSRT(current.cues)));
     const maps=['-map','0:v:0','-map','0:a:0?','-map','1:0'];
     const meta=['-metadata:s:s:0','language=eng','-disposition:s:0','default'];
+
+    // Read the stream headers first (cheap — ffmpeg stops at "no output file")
+    // so the very first real attempt already uses the right audio setting,
+    // instead of burning a full pass discovering the audio cannot be copied.
+    ffLog.length=0;
+    try{ await ff.exec(['-hide_banner','-i',inName]); }catch(_){}
+    const aud=(ffLog.join('\n').match(/Audio:\s*([a-z0-9_]+)/i)||[])[1]||'';
+    const audioOK=/^(aac|mp3|ac3|eac3|alac|mp4a)$/i.test(aud);
+    if(aud && !audioOK) console.info('audio codec "'+aud+'" cannot live in an MP4 — will convert it');
     // +faststart rewrites the whole file to move the index to the front. That
     // is worth it for web playback but needs a second full pass, so skip it on
     // large files where the memory cost is what breaks the export.
@@ -1074,18 +1083,32 @@ $('dlMp4').addEventListener('click',async ()=>{
     // Try hardest-to-easiest, stopping at the first that works. Keeping the
     // video stream copied in every MP4 attempt means no quality loss and no
     // long encode; only the audio is ever re-encoded, which is quick.
-    const attempts = plan.ext==='.mp4' ? [
-      {label:'copy',  args:[...maps,'-c','copy','-c:s','mov_text',...meta,...fast], out:'out.mp4', ext:'.mp4', mime:'video/mp4'},
-      {label:'aac',   args:[...maps,'-c:v','copy','-c:a','aac','-b:a','160k','-c:s','mov_text',...meta,...fast], out:'out.mp4', ext:'.mp4', mime:'video/mp4', reencoded:true},
-      {label:'mkv',   args:[...maps,'-c','copy','-c:s','srt',...meta], out:'out.mkv', ext:'.mkv', mime:'video/x-matroska'},
-    ] : [
-      {label:'mkv',   args:[...maps,'-c','copy','-c:s','srt',...meta], out:'out.mkv', ext:'.mkv', mime:'video/x-matroska'},
-    ];
+    const COPY={label:'copy', args:[...maps,'-c','copy','-c:s','mov_text',...meta,...fast], out:'out.mp4', ext:'.mp4', mime:'video/mp4'};
+    const AAC ={label:'aac',  args:[...maps,'-c:v','copy','-c:a','aac','-b:a','160k','-c:s','mov_text',...meta,...fast], out:'out.mp4', ext:'.mp4', mime:'video/mp4', reencoded:true};
+    const MKV ={label:'mkv',  args:[...maps,'-c','copy','-c:s','srt',...meta], out:'out.mkv', ext:'.mkv', mime:'video/x-matroska'};
+    const attempts = plan.ext!=='.mp4' ? [MKV]
+                   : audioOK ? [COPY, AAC, MKV]
+                   : [AAC, COPY, MKV];   // known-bad audio: convert it first
 
-    let code=1, used=null;
+    let code=1, used=null, first=true;
     for(const a of attempts){
+      // An ffmpeg failure often ends in Aborted(), which kills the WebAssembly
+      // runtime — every later command on the same instance would fail too.
+      // So after any failed attempt, throw the instance away and start fresh.
+      if(!first){
+        mp4Status.textContent='Restarting the video toolkit and trying another way…';
+        try{ if(mounted) await ff.unmount('/src'); }catch(_){}
+        try{ ff.terminate(); }catch(_){}
+        ffmpegInst=null;
+        ff=await getFFmpeg(m=>mp4Status.textContent=m);
+        try{ await ff.createDir('/src'); }catch(_){}
+        await ff.mount(FFFS.WORKERFS,{files:[f]},'/src');
+        mounted=true;
+        await ff.writeFile('caps.srt', new TextEncoder().encode(toSRT(current.cues)));
+      }
+      first=false;
       ffLog.length=0;
-      if(a.label==='aac') mp4Status.textContent='The audio format cannot go inside an MP4 as-is — converting just the audio (the picture is untouched)…';
+      if(a.label==='aac') mp4Status.textContent='This video’s audio is uncompressed, which an MP4 cannot hold — converting just the audio. The picture is copied untouched.';
       if(a.label==='mkv') mp4Status.textContent='MP4 could not hold this video’s streams — repackaging as .mkv instead…';
       code=await ff.exec(['-i',inName,'-i','caps.srt',...a.args,a.out]);
       if(code===0){ used=a; break; }
