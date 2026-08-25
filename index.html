@@ -187,6 +187,10 @@
         <button id="dlMp4" class="ghost">Download .mp4 with captions built in</button>
       </div>
       <div class="hint" id="mp4Status" role="status" aria-live="polite"></div>
+      <div class="bar" id="diagWrap" hidden style="margin-top:6px">
+        <button id="diagBtn" class="ghost tiny">Copy technical details</button>
+        <span class="hint" id="diagNote" style="margin:0"></span>
+      </div>
       <div class="hint">Use <strong>.srt</strong> for Canvas Studio, Panopto, YouTube and VLC. Use <strong>.vtt</strong> for a web page or an HTML5 <code>&lt;video&gt;</code> tag. Upload the caption file next to the video &mdash; that way the student can turn captions on, resize them, and search the text. The <strong>.mp4 with captions built in</strong> is one file with a real caption track (not burned-in) &mdash; it plays with captions in VLC, QuickTime, and the Windows Media Player, and the student can still turn them off or restyle them.</div>
     </div>
   </div>
@@ -981,7 +985,17 @@ async function getFFmpeg(onMsg){
   return ff;
 }
 const mp4Status=$('mp4Status');
-let muxBusy=false, skipPicker=false;
+let muxBusy=false, skipPicker=false, lastDiag='';
+function showDiag(){ $('diagWrap').hidden=false; }
+$('diagBtn').addEventListener('click',async ()=>{
+  const f=current&&current.file;
+  const text='Caption Studio diagnostics\n'+
+    'file: '+(f?f.name+' — '+(f.size/1048576).toFixed(1)+' MB, type "'+(f.type||'unknown')+'"':'none')+'\n'+
+    'engine: '+backendUsed+', threads: '+wasmThreads+', isolated: '+!!self.crossOriginIsolated+'\n'+
+    'browser: '+navigator.userAgent+'\n\n'+lastDiag;
+  try{ await navigator.clipboard.writeText(text); $('diagNote').textContent='Copied — paste it to Joel/Claude.'; }
+  catch(_){ console.log(text); $('diagNote').textContent='Clipboard blocked — the details are in the browser console (F12).'; }
+});
 $('dlMp4').addEventListener('click',async ()=>{
   if(muxBusy) return;
   if(!current || !current.cues || !current.cues.filter(c=>c.text.trim()).length){
@@ -1027,6 +1041,7 @@ $('dlMp4').addEventListener('click',async ()=>{
   }
 
   muxBusy=true; $('dlMp4').disabled=true;
+  $('diagWrap').hidden=true; $('diagNote').textContent='';
   let handleDropped=false;
   try{
     const ff=await getFFmpeg(m=>mp4Status.textContent=m);
@@ -1049,32 +1064,45 @@ $('dlMp4').addEventListener('click',async ()=>{
       await ff.writeFile(inName,new Uint8Array(await f.arrayBuffer()));
     }
     await ff.writeFile('caps.srt', new TextEncoder().encode(toSRT(current.cues)));
-    // MP4 first; VP8/VP9/Opus sources (.webm) cannot go in an MP4 without
-    // re-encoding, so fall back to MKV, which takes any codec and plays in VLC.
-    const common=['-map','0:v:0','-map','0:a:0?','-map','1:0','-c','copy',
-                  '-metadata:s:s:0','language=eng','-disposition:s:0','default'];
+    const maps=['-map','0:v:0','-map','0:a:0?','-map','1:0'];
+    const meta=['-metadata:s:s:0','language=eng','-disposition:s:0','default'];
     // +faststart rewrites the whole file to move the index to the front. That
     // is worth it for web playback but needs a second full pass, so skip it on
     // large files where the memory cost is what breaks the export.
-    const fast = (plan.ext==='.mp4' && mb<=500) ? ['-movflags','+faststart'] : [];
-    ffLog.length=0;
-    let code=await ff.exec(['-i',inName,'-i','caps.srt',...common,'-c:s',plan.sub,...fast,plan.out]);
+    const fast = mb<=500 ? ['-movflags','+faststart'] : [];
 
-    // If MP4 packaging failed, MKV accepts practically any combination of
-    // streams. Switch the whole plan — including the file name — so the
-    // extension can never disagree with what is inside. A save location the
-    // user already picked is for a .mp4, so that file is delivered as a
-    // download instead of writing mismatched bytes into it.
-    if(code!==0 && plan.ext==='.mp4'){
-      console.warn('MP4 remux failed; ffmpeg said:', ffReason(), ffLog.slice(-25));
-      mp4Status.textContent='MP4 could not hold this video’s streams — repackaging as .mkv instead…';
+    // Try hardest-to-easiest, stopping at the first that works. Keeping the
+    // video stream copied in every MP4 attempt means no quality loss and no
+    // long encode; only the audio is ever re-encoded, which is quick.
+    const attempts = plan.ext==='.mp4' ? [
+      {label:'copy',  args:[...maps,'-c','copy','-c:s','mov_text',...meta,...fast], out:'out.mp4', ext:'.mp4', mime:'video/mp4'},
+      {label:'aac',   args:[...maps,'-c:v','copy','-c:a','aac','-b:a','160k','-c:s','mov_text',...meta,...fast], out:'out.mp4', ext:'.mp4', mime:'video/mp4', reencoded:true},
+      {label:'mkv',   args:[...maps,'-c','copy','-c:s','srt',...meta], out:'out.mkv', ext:'.mkv', mime:'video/x-matroska'},
+    ] : [
+      {label:'mkv',   args:[...maps,'-c','copy','-c:s','srt',...meta], out:'out.mkv', ext:'.mkv', mime:'video/x-matroska'},
+    ];
+
+    let code=1, used=null;
+    for(const a of attempts){
       ffLog.length=0;
-      plan.out='out.mkv'; plan.ext='.mkv'; plan.mime='video/x-matroska'; plan.sub='srt';
-      if(handle){ handle=null; handleDropped=true; }
-      code=await ff.exec(['-i',inName,'-i','caps.srt',...common,'-c:s',plan.sub,plan.out]);
+      if(a.label==='aac') mp4Status.textContent='The audio format cannot go inside an MP4 as-is — converting just the audio (the picture is untouched)…';
+      if(a.label==='mkv') mp4Status.textContent='MP4 could not hold this video’s streams — repackaging as .mkv instead…';
+      code=await ff.exec(['-i',inName,'-i','caps.srt',...a.args,a.out]);
+      if(code===0){ used=a; break; }
+      const why=ffReason();
+      console.warn('attempt "'+a.label+'" failed; ffmpeg said:', why, ffLog.slice(-25));
+      lastDiag='attempt '+a.label+' failed\nffmpeg: '+(why||'(no specific line)')+'\n\n'+ffLog.slice(-40).join('\n');
+      try{ await ff.deleteFile(a.out); }catch(_){}
     }
-    if(code!==0){
-      console.warn('remux failed; ffmpeg log tail:', ffLog.slice(-30));
+    if(used){
+      plan.out=used.out; plan.ext=used.ext; plan.mime=used.mime;
+      // A save location the user picked is named .mp4; never write .mkv bytes
+      // into it — deliver that one as a download instead.
+      if(handle && plan.ext!=='.mp4'){ handle=null; handleDropped=true; }
+    }
+    if(!used){
+      console.warn('all remux attempts failed; log tail:', ffLog.slice(-30));
+      showDiag();
       throw new Error('remux failed'+(ffReason()?': '+ffReason():''));
     }
 
@@ -1087,7 +1115,11 @@ $('dlMp4').addEventListener('click',async ()=>{
     const isMP4 = sig==='ftyp';
     const isMKV = data[0]===0x1A&&data[1]===0x45&&data[2]===0xDF&&data[3]===0xA3;
     if((plan.ext==='.mp4'&&!isMP4)||(plan.ext==='.mkv'&&!isMKV)) throw new Error('remux produced an unreadable file');
-    if(data.length < f.size*0.5) throw new Error('remux produced a truncated file');
+    // A straight copy should come back about the same size. When the audio was
+    // re-encoded the file legitimately shrinks — sometimes a lot, if the source
+    // held uncompressed audio — so only guard against something clearly empty.
+    const floor = used.reencoded ? Math.min(f.size*0.05, 1048576) : f.size*0.5;
+    if(data.length < floor) throw new Error('remux produced a truncated file');
 
     mp4Status.textContent='Saving the file…';
     const outFile=nameFor(f)+'-captioned'+plan.ext;
@@ -1118,6 +1150,7 @@ $('dlMp4').addEventListener('click',async ()=>{
     const reason=ffReason();
     const oom=/out of memory|Cannot enlarge|allocat|OOM|No space/i.test(m+' '+reason)||m==='too-big-nomount';
     const bad=/unreadable|truncated|empty file/.test(m);
+    showDiag();
     const sidecar=' Share the .srt next to the video instead — name them the same (lecture.mp4 + lecture.srt) and VLC loads the captions automatically.';
     mp4Status.textContent =
       m.startsWith('Could not download') ? m :
