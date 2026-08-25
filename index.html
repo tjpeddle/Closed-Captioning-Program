@@ -985,6 +985,14 @@ $('dlMp4').addEventListener('click',async ()=>{
     return;
   }
 
+  // Decide the container BEFORE asking where to save, so the name the user
+  // picks always matches the bytes we end up writing. Only MP4-family sources
+  // can be copied into an MP4; anything else goes to MKV.
+  const mp4able=/\.(mp4|m4v|mov)$/i.test(f.name) || f.type==='video/mp4' || f.type==='video/quicktime';
+  const plan = mp4able
+    ? {out:'out.mp4', ext:'.mp4', mime:'video/mp4', sub:'mov_text'}
+    : {out:'out.mkv', ext:'.mkv', mime:'video/x-matroska', sub:'srt'};
+
   // For big files, ask where to save BEFORE the long work: it needs a fresh
   // click, and writing straight to disk avoids holding another whole copy in
   // memory. Small files just download normally — no dialog to dismiss.
@@ -992,8 +1000,9 @@ $('dlMp4').addEventListener('click',async ()=>{
   if(mb>400 && window.showSaveFilePicker && !skipPicker){
     try{
       handle=await window.showSaveFilePicker({
-        suggestedName:nameFor(f)+'-captioned.mp4',
-        types:[{description:'Video',accept:{'video/mp4':['.mp4'],'video/x-matroska':['.mkv']}}]
+        suggestedName:nameFor(f)+'-captioned'+plan.ext,
+        types:[{description:plan.ext==='.mp4'?'MP4 video':'Matroska video',
+                accept:{[plan.mime]:[plan.ext]}}]
       });
     }catch(err){
       // Cancelled, blocked by policy, or unsupported — never dead-end here.
@@ -1029,16 +1038,26 @@ $('dlMp4').addEventListener('click',async ()=>{
     // re-encoding, so fall back to MKV, which takes any codec and plays in VLC.
     const common=['-map','0:v:0','-map','0:a:0?','-map','1:0','-c','copy',
                   '-metadata:s:s:0','language=eng','-disposition:s:0','default'];
-    let outName='out.mp4', mime='video/mp4', ext='.mp4';
-    let code=await ff.exec(['-i',inName,'-i','caps.srt',...common,'-c:s','mov_text','-movflags','+faststart',outName]);
-    if(code!==0){
-      mp4Status.textContent='That video uses a format MP4 cannot hold — packaging it as .mkv instead (plays in VLC)…';
-      outName='out.mkv'; mime='video/x-matroska'; ext='.mkv';
-      code=await ff.exec(['-i',inName,'-i','caps.srt',...common,'-c:s','srt',outName]);
-    }
+    // +faststart rewrites the whole file to move the index to the front. That
+    // is worth it for web playback but needs a second full pass, so skip it on
+    // large files where the memory cost is what breaks the export.
+    const fast = (plan.ext==='.mp4' && mb<=500) ? ['-movflags','+faststart'] : [];
+    const code=await ff.exec(['-i',inName,'-i','caps.srt',...common,'-c:s',plan.sub,...fast,plan.out]);
     if(code!==0) throw new Error('remux failed');
+
+    mp4Status.textContent='Checking the packaged file…';
+    const data=await ff.readFile(plan.out);
+    // Never hand over a file we have not verified: confirm the container
+    // signature and a sane size before writing anything to disk.
+    if(!data || data.length<1024) throw new Error('remux produced an empty file');
+    const sig=String.fromCharCode(...data.slice(4,8));
+    const isMP4 = sig==='ftyp';
+    const isMKV = data[0]===0x1A&&data[1]===0x45&&data[2]===0xDF&&data[3]===0xA3;
+    if((plan.ext==='.mp4'&&!isMP4)||(plan.ext==='.mkv'&&!isMKV)) throw new Error('remux produced an unreadable file');
+    if(data.length < f.size*0.5) throw new Error('remux produced a truncated file');
+
     mp4Status.textContent='Saving the file…';
-    const data=await ff.readFile(outName);
+    const outFile=nameFor(f)+'-captioned'+plan.ext;
     let where;
     if(handle){
       const w=await handle.createWritable();
@@ -1047,23 +1066,26 @@ $('dlMp4').addEventListener('click',async ()=>{
       where='saved where you chose';
     }else{
       const a=document.createElement('a');
-      a.href=URL.createObjectURL(new Blob([data.buffer],{type:mime}));
-      a.download=nameFor(f)+'-captioned'+ext;
+      a.href=URL.createObjectURL(new Blob([data],{type:plan.mime}));
+      a.download=outFile;
       document.body.appendChild(a); a.click();
       setTimeout(()=>{URL.revokeObjectURL(a.href);a.remove();},1500);
       where='in your downloads';
     }
-    mp4Status.textContent='Done — '+nameFor(f)+'-captioned'+ext+' is '+where+
-      '. Captions are on by default in VLC; other players show them under the subtitle or CC menu.';
-    try{ await ff.deleteFile('caps.srt'); await ff.deleteFile(outName); }catch(_){}
+    mp4Status.textContent='Done — '+outFile+' is '+where+
+      (plan.ext==='.mkv'?'. This video’s format cannot go inside an MP4 without re-encoding, so it is packaged as .mkv — VLC plays it, Windows Media Player may not.':'')+
+      ' Captions are on by default in VLC; other players show them under the subtitle or CC menu.';
+    try{ await ff.deleteFile('caps.srt'); await ff.deleteFile(plan.out); }catch(_){}
     if(mounted){ try{ await ff.unmount('/src'); }catch(_){} }
     else { try{ await ff.deleteFile(inName); }catch(_){} }
   }catch(err){
     console.error(err);
     const m=(err&&err.message)||'';
     const oom=/memory|allocat|OOM|Aborted/i.test(m)||m==='too-big-nomount';
+    const bad=/unreadable|truncated|empty file/.test(m);
     mp4Status.textContent =
       m.startsWith('Could not download') ? m :
+      bad ? 'The packaged file came out damaged, so it was not saved — better than handing you a video that will not open. This usually means the computer ran short of memory on a video this large. Share the .srt next to the video instead (name them the same — lecture.mp4 + lecture.srt — and VLC loads the captions automatically), or shrink the video in HandBrake first and try again.' :
       oom ? 'This computer ran out of memory packaging a video this large. Two ways forward: share the .srt next to the video (name them the same — lecture.mp4 + lecture.srt — and VLC loads captions automatically), or shrink the video in HandBrake first and then repackage it here. Closing other browser tabs before retrying can also be enough.'
           : 'This video’s format could not be repackaged without re-encoding. Convert it to MP4 (H.264/AAC) first, or share the .srt next to the video — VLC pairs them automatically when the names match.';
   }finally{
