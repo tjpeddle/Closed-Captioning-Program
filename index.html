@@ -478,40 +478,68 @@ async function run(){
 
 async function transcribeItem(item, asr, label){
   const t0=performance.now();
-  say(label+'Reading the audio out of '+item.file.name+'…');
-  const {audio,duration}=await extractAudio(item.file);
+  let stageName='read', gotChunk=false;
 
-  let feed=audio, segs=null, skipNote='';
-  if(skipSil.checked){
-    const r=skipSilence(audio,16000);
-    if(r){
-      feed=r.audio; segs=r.segs;
-      const m=Math.round(r.skipped/60), s=Math.round(r.skipped);
-      skipNote=' · skipped '+(s<90?s+' s':m+' min')+' of silence';
+  // Heartbeat: some stages (audio decode, first-chunk model warm-up) give no
+  // progress events at all, so tick a visible timer — the page must never
+  // look frozen while it is actually working.
+  const beat=setInterval(()=>{
+    const s=Math.round((performance.now()-t0)/1000);
+    if(stageName==='read'){
+      say(`${label}Reading the audio out of ${item.file.name}… ${s}s`);
+      item.note='reading audio… '+s+'s'; renderQueue();
+    }else if(stageName==='warm' && !gotChunk){
+      say(`${label}Model is working on the first stretch of audio… ${s}s — the first chunk includes one-time warm-up and is by far the slowest. It speeds up after this.`);
+      item.note='warming up… '+s+'s'; renderQueue();
     }
+  },1000);
+
+  try{
+    say(label+'Reading the audio out of '+item.file.name+'…');
+    const {audio,duration}=await extractAudio(item.file);
+
+    let feed=audio, segs=null, skipNote='';
+    if(skipSil.checked){
+      const r=skipSilence(audio,16000);
+      if(r){
+        feed=r.audio; segs=r.segs;
+        const m=Math.round(r.skipped/60), s=Math.round(r.skipped);
+        skipNote=' · skipped '+(s<90?s+' s':m+' min')+' of silence';
+      }
+    }
+
+    const cfg=MODELS[modelSel.value]||{chunk:30,stride:5};
+    const feedDur=feed.length/16000;
+    const step=Math.max(1,cfg.chunk-2*cfg.stride);
+    const total=Math.max(1,Math.ceil(feedDur/step));
+    let done=0;
+    bar.value=0;
+    stageName='warm';
+    say(`${label}Audio loaded — ${Math.round(duration/60)||'<1'} min${skipNote}. Starting the model…`);
+
+    const out=await asr(feed,{
+      chunk_length_s:cfg.chunk,
+      stride_length_s:cfg.stride,
+      return_timestamps:true,
+      chunk_callback:()=>{
+        gotChunk=true;
+        done++;
+        const pct=Math.min(99,Math.round(100*done/total));
+        bar.value=pct;
+        item.note='transcribing '+pct+'%'; renderQueue();
+        const elapsed=(performance.now()-t0)/1000;
+        const eta=done>1?Math.round(elapsed/done*(total-done)):null;
+        say(`${label}Transcribing… ${pct}%${eta!==null?`  ·  about ${eta<90?eta+' s':Math.round(eta/60)+' min'} left`:''}  ·  on ${backendUsed==='webgpu'?'your graphics card':'CPU (slower — use Chrome or Edge for the fast path)'}${skipNote}`);
+      }
+    });
+    clearInterval(beat);
+    return finishItem(item, out, segs, duration);
+  }finally{
+    clearInterval(beat);
   }
+}
 
-  const cfg=MODELS[modelSel.value]||{chunk:30,stride:5};
-  const feedDur=feed.length/16000;
-  const step=Math.max(1,cfg.chunk-2*cfg.stride);
-  const total=Math.max(1,Math.ceil(feedDur/step));
-  let done=0;
-  bar.value=0;
-
-  const out=await asr(feed,{
-    chunk_length_s:cfg.chunk,
-    stride_length_s:cfg.stride,
-    return_timestamps:true,
-    chunk_callback:()=>{
-      done++;
-      const pct=Math.min(99,Math.round(100*done/total));
-      bar.value=pct;
-      item.note='transcribing '+pct+'%'; renderQueue();
-      const elapsed=(performance.now()-t0)/1000;
-      const eta=done>1?Math.round(elapsed/done*(total-done)):null;
-      say(`${label}Transcribing… ${pct}%${eta!==null?`  ·  about ${eta<90?eta+' s':Math.round(eta/60)+' min'} left`:''}  ·  on ${backendUsed==='webgpu'?'your graphics card':'CPU (slower — use Chrome or Edge for the fast path)'}${skipNote}`);
-    }
-  });
+function finishItem(item, out, segs, duration){
 
   const chunks=(out.chunks||[]).map(c=>{
     if(!segs) return c;
