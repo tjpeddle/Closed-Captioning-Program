@@ -201,6 +201,7 @@
     <summary>Requirements and troubleshooting</summary>
     <ul>
       <li>Works best in <strong>Chrome or Edge</strong> on a desktop or laptop. Safari and Firefox may fall back to a much slower mode.</li>
+      <li>The very first run tests your graphics card for up to 90 seconds. If the graphics driver fails the test, the page switches itself to the CPU engine and remembers that choice &mdash; a banner at the top lets you retry the fast mode after a driver update.</li>
       <li>Leave the tab open and awake while it works. Closing it stops the job.</li>
       <li>If the file will not decode, re-export or convert it to <strong>MP4 (H.264/AAC)</strong> and try again.</li>
       <li>Your edits are saved in this browser automatically, so a reload will not lose your work on the same file.</li>
@@ -215,6 +216,24 @@
 import { pipeline, env } from 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3/dist/transformers.min.js';
 
 env.allowLocalModels = false;
+
+/* Multi-core CPU engine: GitHub Pages cannot send the isolation headers that
+   unlock multithreading, so a small service worker (coi-sw.js) adds them.
+   The very first visit reloads once, automatically, to pick them up. */
+if(location.protocol==='https:' && 'serviceWorker' in navigator && !crossOriginIsolated){
+  navigator.serviceWorker.register('./coi-sw.js').then(async ()=>{
+    await navigator.serviceWorker.ready;
+    if(!navigator.serviceWorker.controller && !sessionStorage.getItem('coiReloaded')){
+      sessionStorage.setItem('coiReloaded','1');
+      location.reload();
+    }
+  }).catch(()=>{});
+}
+if(self.crossOriginIsolated){
+  try{
+    env.backends.onnx.wasm.numThreads=Math.min(Math.max(2,(navigator.hardwareConcurrency||4)-2),8);
+  }catch(_){}
+}
 
 /* ---------- element handles ---------- */
 const $ = id => document.getElementById(id);
@@ -238,15 +257,17 @@ let queue=[], current=null, cues=[], transcriber=null, loadedModelId=null, runni
    software emulator (SwiftShader) that is slower than plain CPU and can look
    hung. Probe the adapter and refuse software GPUs. */
 const FORCE_CPU_KEY='capstudio:forceCpu';
+const GPU_SLOW_KEY='capstudio:gpuSlow';
 let hasGPU=false, backendUsed='';
 
 async function detectGPU(){
   try{
     if(new URLSearchParams(location.search).has('cpu')) localStorage.setItem(FORCE_CPU_KEY,'1');
   }catch(_){}
-  let forced=false;
-  try{ forced=localStorage.getItem(FORCE_CPU_KEY)==='1'; }catch(_){}
+  let forced=false, slow=false;
+  try{ forced=localStorage.getItem(FORCE_CPU_KEY)==='1'; slow=localStorage.getItem(GPU_SLOW_KEY)==='1'; }catch(_){}
   if(forced) return {ok:false, why:'compatibility mode is switched on', forced:true};
+  if(slow) return {ok:false, why:'this computer’s graphics driver stalled on the speech model last time, so the CPU engine is used instead', slowFlag:true};
   try{
     if(!navigator.gpu) return {ok:false, why:'this browser does not offer WebGPU'};
     const ad=await navigator.gpu.requestAdapter();
@@ -268,10 +289,10 @@ const gpuCheck=detectGPU().then(r=>{
     compat.className='note warn';
     let msg='<strong>Running in CPU mode:</strong> '+r.why+'. Captioning still works — it is just slower (roughly the length of the video, sometimes more). On this computer the <strong>Quick</strong> accuracy setting is a sensible trade: about 3&times; faster, still a solid draft to edit. ';
     if(r.soft) msg+='This usually means graphics acceleration is disabled: open <code>chrome://settings/system</code>, turn on &ldquo;Use graphics acceleration when available&rdquo;, relaunch Chrome, and reload this page. On a university-managed computer, IT may control that setting. ';
-    if(r.forced) msg+='<button id="unforce" class="ghost tiny" style="margin-left:6px">Turn the fast mode back on</button>';
+    if(r.forced||r.slowFlag) msg+='<button id="unforce" class="ghost tiny" style="margin-left:6px">Try the fast mode again</button>';
     compat.innerHTML=msg;
     const un=document.getElementById('unforce');
-    if(un) un.addEventListener('click',()=>{ try{localStorage.removeItem(FORCE_CPU_KEY);}catch(_){} location.href=location.pathname; });
+    if(un) un.addEventListener('click',()=>{ try{localStorage.removeItem(FORCE_CPU_KEY);localStorage.removeItem(GPU_SLOW_KEY);}catch(_){} location.href=location.pathname; });
   }
   return r;
 });
@@ -385,8 +406,16 @@ async function extractAudio(file){
   return {audio:out, duration:decoded.duration};
 }
 
-/* ---------- model loading with graceful fallback ---------- */
-async function getTranscriber(id,onProgress){
+/* ---------- model loading with graceful fallback ----------
+   A working GPU driver is not guaranteed even when WebGPU reports hardware
+   acceleration: some drivers stall for many minutes compiling the model's
+   shaders. So the first GPU inference runs as a timed probe on one second of
+   audio — if it doesn't finish inside PROBE_MS, the GPU path is abandoned for
+   good on this machine (remembered in localStorage, reversible from the
+   banner) and the CPU engine takes over. A probe that passes doubles as the
+   warm-up, so the first real chunk is fast. */
+const PROBE_MS=90000;
+async function getTranscriber(id,onProgress,onProbe){
   if(transcriber && loadedModelId===id) return transcriber;
   if(transcriber && transcriber.dispose){ try{ await transcriber.dispose(); }catch(_){} }
   transcriber=null;
@@ -395,13 +424,29 @@ async function getTranscriber(id,onProgress){
        {device:'webgpu',dtype:'q8'},
        {device:'wasm',dtype:'q8'}]
     : [{device:'wasm',dtype:'q8'}];
-  let lastErr=null;
+  let lastErr=null, gpuGaveUp=false;
   for(const opt of attempts){
+    if(opt.device==='webgpu' && gpuGaveUp) continue;
     try{
-      transcriber=await pipeline('automatic-speech-recognition',id,{...opt,progress_callback:onProgress});
+      const pl=await pipeline('automatic-speech-recognition',id,{...opt,progress_callback:onProgress});
+      if(opt.device==='webgpu'){
+        if(onProbe) onProbe(true);
+        const ok=await Promise.race([
+          pl(new Float32Array(16000)).then(()=>true).catch(()=>false),
+          new Promise(res=>setTimeout(()=>res(false),PROBE_MS))
+        ]);
+        if(onProbe) onProbe(false);
+        if(!ok){
+          gpuGaveUp=true;
+          try{ localStorage.setItem(GPU_SLOW_KEY,'1'); }catch(_){}
+          console.warn('WebGPU probe failed or timed out — switching to CPU engine');
+          continue;
+        }
+      }
+      transcriber=pl;
       loadedModelId=id;
       backendUsed=opt.device;
-      return transcriber;
+      return pl;
     }catch(e){ lastErr=e; console.warn('pipeline attempt failed',opt,e); }
   }
   throw lastErr || new Error('Could not load the speech model.');
@@ -471,6 +516,7 @@ async function run(){
     await gpuCheck;
     say('Preparing the speech model (one-time download)…');
     const seen={};
+    let probeTick=null;
     const asr=await getTranscriber(modelSel.value,p=>{
       if(p.status==='progress' && p.total){
         seen[p.file]=p.loaded/p.total;
@@ -479,7 +525,18 @@ async function run(){
         bar.value=pct;
         say(`Downloading speech model… ${pct}% (one time only — it is cached after this)`);
       }
+    },probing=>{
+      if(probing){
+        const t=performance.now();
+        say('Checking that your graphics card runs the model properly… (up to 90 seconds, first run only)');
+        probeTick=setInterval(()=>{
+          say(`Checking that your graphics card runs the model properly… ${Math.round((performance.now()-t)/1000)}s of up to 90. If it fails the check, the CPU engine takes over automatically.`);
+        },1000);
+      }else{
+        clearInterval(probeTick);
+      }
     });
+    if(probeTick) clearInterval(probeTick);
 
     const todo=queue.filter(q=>q.status==='waiting');
     let idx=0, ok=0;
