@@ -1,0 +1,619 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Caption Studio — drop a video, get captions</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%237c3aed'/%3E%3Crect x='6' y='19' width='20' height='3' rx='1.5' fill='white'/%3E%3Crect x='6' y='24' width='13' height='3' rx='1.5' fill='white'/%3E%3Cpath d='M13 7l8 5-8 5z' fill='white'/%3E%3C/svg%3E">
+<style>
+  :root{
+    --bg:#f6f7f9; --panel:#ffffff; --ink:#15181d; --muted:#5b6472;
+    --line:#dde1e8; --accent:#7c3aed; --accent-ink:#ffffff;
+    --ok:#0f8a5f; --warn:#a15c00; --warnbg:#fff6e5; --err:#b3261e; --errbg:#fdecea;
+    --focus:#7c3aed; --radius:12px;
+  }
+  @media (prefers-color-scheme:dark){
+    :root{
+      --bg:#101318; --panel:#191d24; --ink:#eef1f6; --muted:#9aa4b2;
+      --line:#2a303a; --accent:#a78bfa; --accent-ink:#16121f;
+      --ok:#4ade80; --warn:#fbbf24; --warnbg:#2a2210; --err:#ff8a80; --errbg:#2a1512;
+    }
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;padding:0}
+  body{
+    background:var(--bg); color:var(--ink);
+    font:16px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    padding:24px 16px 64px;
+  }
+  .wrap{max-width:1060px;margin:0 auto}
+  h1{font-size:1.6rem;margin:0 0 4px;letter-spacing:-.02em}
+  h2{font-size:1.05rem;margin:0 0 10px;letter-spacing:-.01em}
+  p.lede{margin:0 0 20px;color:var(--muted)}
+  .panel{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:18px;margin-bottom:16px}
+  .step{display:flex;align-items:center;gap:8px;font-size:.78rem;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);margin-bottom:10px}
+  .step b{display:inline-flex;align-items:center;justify-content:center;width:22px;height:22px;border-radius:50%;background:var(--accent);color:var(--accent-ink);font-size:.75rem}
+  button{
+    font:inherit;font-weight:600;border:1px solid transparent;border-radius:9px;
+    padding:9px 16px;cursor:pointer;background:var(--accent);color:var(--accent-ink);
+  }
+  button.ghost{background:transparent;color:var(--ink);border-color:var(--line)}
+  button.tiny{padding:3px 9px;font-size:.8rem;font-weight:500}
+  button:disabled{opacity:.45;cursor:not-allowed}
+  button:focus-visible,select:focus-visible,textarea:focus-visible,input:focus-visible,#drop:focus-visible{
+    outline:3px solid var(--focus);outline-offset:2px
+  }
+  select,input[type=text]{font:inherit;padding:7px 10px;border-radius:8px;border:1px solid var(--line);background:var(--panel);color:var(--ink)}
+  label{font-weight:600;font-size:.9rem}
+  #drop{
+    border:2px dashed var(--line);border-radius:var(--radius);padding:40px 20px;text-align:center;
+    background:var(--panel);cursor:pointer;transition:.15s;
+  }
+  #drop.hot{border-color:var(--accent);background:color-mix(in srgb,var(--accent) 8%,var(--panel))}
+  #drop .big{font-size:1.15rem;font-weight:600}
+  #drop .sub{color:var(--muted);font-size:.9rem;margin-top:6px}
+  .row{display:flex;flex-wrap:wrap;gap:14px;align-items:flex-end}
+  .row > div{display:flex;flex-direction:column;gap:5px}
+  .hint{font-size:.82rem;color:var(--muted);margin-top:8px}
+  .note{border-left:3px solid var(--accent);padding:10px 14px;background:color-mix(in srgb,var(--accent) 7%,transparent);border-radius:0 8px 8px 0;font-size:.9rem}
+  .warn{background:var(--warnbg);border-left-color:var(--warn);color:var(--ink)}
+  .err{background:var(--errbg);border-left-color:var(--err)}
+  progress{width:100%;height:12px;border-radius:99px;overflow:hidden}
+  #stage{display:none}
+  #review{display:none}
+  .grid{display:grid;grid-template-columns:minmax(300px,1fr) minmax(320px,1.15fr);gap:16px}
+  @media(max-width:860px){.grid{grid-template-columns:1fr}}
+  .vidbox{position:relative;background:#000;border-radius:10px;overflow:hidden}
+  video{width:100%;display:block;max-height:44vh;background:#000}
+  #overlay{
+    position:absolute;left:0;right:0;bottom:52px;text-align:center;pointer-events:none;
+    font-size:clamp(14px,2.2vw,20px);line-height:1.35;padding:0 6%;
+  }
+  #overlay span{background:rgba(0,0,0,.82);color:#fff;padding:3px 9px;border-radius:4px;box-decoration-break:clone;-webkit-box-decoration-break:clone}
+  #cues{max-height:52vh;overflow:auto;border:1px solid var(--line);border-radius:10px}
+  .cue{display:grid;grid-template-columns:104px 1fr;gap:10px;padding:9px 10px;border-bottom:1px solid var(--line)}
+  .cue:last-child{border-bottom:0}
+  .cue.active{background:color-mix(in srgb,var(--accent) 12%,transparent)}
+  .cue .times{display:flex;flex-direction:column;gap:4px}
+  .cue .times input{font:500 .76rem/1 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;padding:4px 5px;width:100%}
+  .cue textarea{
+    font:inherit;width:100%;min-height:52px;resize:vertical;border:1px solid var(--line);
+    border-radius:8px;padding:7px 9px;background:var(--panel);color:var(--ink)
+  }
+  .cue .tools{grid-column:2;display:flex;gap:6px;margin-top:5px;flex-wrap:wrap}
+  .over{color:var(--warn);font-weight:700}
+  .bar{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-top:14px}
+  .sr{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
+  details{border:1px solid var(--line);border-radius:var(--radius);background:var(--panel);padding:12px 18px;margin-bottom:16px}
+  summary{cursor:pointer;font-weight:600}
+  details ol,details ul{padding-left:20px}
+  code{background:color-mix(in srgb,var(--ink) 8%,transparent);padding:1px 5px;border-radius:4px;font-size:.88em}
+  footer{color:var(--muted);font-size:.84rem;text-align:center;margin-top:28px}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <h1>Caption Studio</h1>
+  <p class="lede">Drop in a lecture video, get an accurate caption file you can upload alongside it. Everything runs inside this browser tab &mdash; <strong>the video never leaves this computer</strong> and no account or key is needed.</p>
+
+  <div id="compat" class="note" hidden></div>
+
+  <!-- STEP 1 -->
+  <div class="panel">
+    <div class="step"><b>1</b> Choose a video or audio file</div>
+    <div id="drop" tabindex="0" role="button" aria-describedby="dropHelp">
+      <div class="big">Drag a file here, or press to browse</div>
+      <div class="sub" id="dropHelp">MP4, MOV, M4A, MP3, WAV, WebM &middot; up to about 2 hours</div>
+    </div>
+    <input id="file" type="file" accept="video/*,audio/*" class="sr">
+    <div id="fileInfo" class="hint" role="status"></div>
+  </div>
+
+  <!-- STEP 2 -->
+  <div class="panel" id="stage">
+    <div class="step"><b>2</b> Generate the first draft</div>
+    <div class="row">
+      <div>
+        <label for="model">Accuracy</label>
+        <select id="model">
+          <option value="Xenova/whisper-tiny.en">Draft &mdash; fastest, most errors</option>
+          <option value="Xenova/whisper-base.en" selected>Standard &mdash; good balance</option>
+          <option value="Xenova/whisper-small.en">Best &mdash; slower, ~500&nbsp;MB download</option>
+        </select>
+      </div>
+      <div>
+        <button id="go">Generate captions</button>
+      </div>
+    </div>
+    <div class="hint">The model downloads once and is then cached by the browser, so later videos start right away. English only.</div>
+    <div id="prog" hidden style="margin-top:14px">
+      <progress id="bar" max="100" value="0"></progress>
+      <div id="progText" class="hint" role="status" aria-live="polite"></div>
+    </div>
+  </div>
+
+  <!-- STEP 3 -->
+  <div id="review">
+    <div class="panel">
+      <div class="step"><b>3</b> Review and fix &mdash; this part matters</div>
+      <div class="note warn">Automatic speech recognition typically gets 90&ndash;95% of words right. For a student who relies on captions, please skim every line: fix names, course terms, and numbers, and add sound cues like <code>[laughter]</code> or <code>[video plays]</code> where they carry meaning. Click any timestamp to jump the video there.</div>
+      <div class="grid" style="margin-top:14px">
+        <div>
+          <div class="vidbox">
+            <video id="video" controls preload="metadata"></video>
+            <div id="overlay" aria-hidden="true"></div>
+          </div>
+          <div class="hint" id="stats"></div>
+        </div>
+        <div>
+          <div id="cues" role="list" aria-label="Caption lines"></div>
+          <div class="bar">
+            <button class="ghost tiny" id="addEnd">Add line at end</button>
+            <span class="hint" id="saveState"></span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="step"><b>4</b> Export</div>
+      <div class="bar">
+        <button id="dlSrt">Download .srt</button>
+        <button id="dlVtt" class="ghost">Download .vtt</button>
+        <button id="dlTxt" class="ghost">Download transcript (.txt)</button>
+      </div>
+      <div class="hint">Use <strong>.srt</strong> for Canvas Studio, Panopto, YouTube and VLC. Use <strong>.vtt</strong> for a web page or an HTML5 <code>&lt;video&gt;</code> tag. Upload the caption file next to the video &mdash; that way the student can turn captions on, resize them, and search the text.</div>
+    </div>
+  </div>
+
+  <details>
+    <summary>Where to put the caption file</summary>
+    <ul>
+      <li><strong>Canvas Studio:</strong> open the video &rarr; Captions tab &rarr; Upload caption file &rarr; choose the <code>.srt</code>.</li>
+      <li><strong>Panopto:</strong> Edit &rarr; Captions &rarr; Upload or import captions.</li>
+      <li><strong>YouTube:</strong> Studio &rarr; Subtitles &rarr; the video &rarr; Add &rarr; Upload file &rarr; With timing.</li>
+      <li><strong>Zoom cloud recording:</strong> Recording settings &rarr; Closed captions &rarr; upload the <code>.vtt</code>.</li>
+      <li><strong>A plain file share:</strong> keep <code>lecture.mp4</code> and <code>lecture.srt</code> in the same folder with the same name &mdash; VLC and most players pick captions up automatically.</li>
+    </ul>
+  </details>
+
+  <details>
+    <summary>Requirements and troubleshooting</summary>
+    <ul>
+      <li>Works best in <strong>Chrome or Edge</strong> on a desktop or laptop. Safari and Firefox may fall back to a much slower mode.</li>
+      <li>Leave the tab open and awake while it works. Closing it stops the job.</li>
+      <li>If the file will not decode, re-export or convert it to <strong>MP4 (H.264/AAC)</strong> and try again.</li>
+      <li>Your edits are saved in this browser automatically, so a reload will not lose your work on the same file.</li>
+      <li>Nothing is uploaded anywhere. The only network traffic is the one-time model download.</li>
+    </ul>
+  </details>
+
+  <footer>Runs entirely in your browser. Speech recognition by OpenAI Whisper via Transformers.js.</footer>
+</div>
+
+<script type="module">
+import { pipeline, env } from 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3/dist/transformers.min.js';
+
+env.allowLocalModels = false;
+
+/* ---------- element handles ---------- */
+const $ = id => document.getElementById(id);
+const drop=$('drop'), fileInput=$('file'), fileInfo=$('fileInfo'), stage=$('stage'),
+      modelSel=$('model'), go=$('go'), prog=$('prog'), bar=$('bar'), progText=$('progText'),
+      review=$('review'), video=$('video'), overlay=$('overlay'), cuesEl=$('cues'),
+      stats=$('stats'), compat=$('compat'), saveState=$('saveState');
+
+let currentFile=null, cues=[], objectUrl=null, transcriber=null, loadedModelId=null, storeKey=null;
+
+/* ---------- environment check ---------- */
+const hasGPU = !!navigator.gpu;
+if(!hasGPU){
+  compat.hidden=false;
+  compat.className='note warn';
+  compat.innerHTML='<strong>Heads up:</strong> this browser does not offer WebGPU, so captioning will run in a slower fallback mode (roughly real&#8209;time or worse). For long lectures, use <strong>Chrome</strong> or <strong>Edge</strong> on a desktop computer, or pick the "Draft" accuracy setting.';
+}
+
+/* ---------- time helpers ---------- */
+const pad=(n,l=2)=>String(Math.max(0,n)).padStart(l,'0');
+function fmt(t,sep=','){
+  if(!isFinite(t)||t<0) t=0;
+  let ms=Math.round(t*1000);
+  const h=Math.floor(ms/3600000); ms-=h*3600000;
+  const m=Math.floor(ms/60000);   ms-=m*60000;
+  const s=Math.floor(ms/1000);    ms-=s*1000;
+  return `${pad(h)}:${pad(m)}:${pad(s)}${sep}${pad(ms,3)}`;
+}
+const short=t=>fmt(t,'.').slice(3,-1); // mm:ss.mm
+function parseTime(str){
+  str=(str||'').trim().replace(',','.');
+  if(!str) return NaN;
+  const parts=str.split(':').map(Number);
+  if(parts.some(n=>isNaN(n))) return NaN;
+  if(parts.length===1) return parts[0];
+  if(parts.length===2) return parts[0]*60+parts[1];
+  return parts[0]*3600+parts[1]*60+parts[2];
+}
+
+/* ---------- file intake ---------- */
+drop.addEventListener('click',()=>fileInput.click());
+drop.addEventListener('keydown',e=>{ if(e.key==='Enter'||e.key===' '){e.preventDefault();fileInput.click();} });
+['dragenter','dragover'].forEach(ev=>drop.addEventListener(ev,e=>{e.preventDefault();drop.classList.add('hot');}));
+['dragleave','drop'].forEach(ev=>drop.addEventListener(ev,e=>{e.preventDefault();drop.classList.remove('hot');}));
+drop.addEventListener('drop',e=>{ const f=e.dataTransfer.files[0]; if(f) accept(f); });
+fileInput.addEventListener('change',()=>{ if(fileInput.files[0]) accept(fileInput.files[0]); });
+
+function accept(f){
+  currentFile=f;
+  storeKey='capstudio:'+f.name+':'+f.size;
+  const mb=(f.size/1048576).toFixed(1);
+  fileInfo.textContent=`Loaded: ${f.name} (${mb} MB)`;
+  stage.style.display='block';
+  if(objectUrl) URL.revokeObjectURL(objectUrl);
+  objectUrl=URL.createObjectURL(f);
+  video.src=objectUrl;
+  if(f.size>1.2e9){
+    fileInfo.textContent+=' — that is a very large file; if it fails, compress it first.';
+  }
+  const saved=loadSaved();
+  if(saved && saved.length){
+    cues=saved;
+    review.style.display='block';
+    renderCues();
+    saveState.textContent='Restored your saved edits for this file.';
+  }else{
+    cues=[]; review.style.display='none';
+  }
+  go.disabled=false;
+  drop.querySelector('.big').textContent='Drop a different file to start over';
+}
+
+/* ---------- audio extraction (16 kHz mono, no upload) ---------- */
+async function extractAudio(file){
+  const buf=await file.arrayBuffer();
+  const AC = window.OfflineAudioContext || window.webkitOfflineAudioContext;
+  const ctx=new AC(1,1,16000);
+  let decoded;
+  try{
+    decoded=await ctx.decodeAudioData(buf);
+  }catch(err){
+    throw new Error('This browser could not read the audio in that file. Convert it to MP4 (H.264/AAC) or export the audio as an .m4a and try again.');
+  }
+  const n=decoded.length;
+  if(decoded.numberOfChannels===1) return {audio:decoded.getChannelData(0), duration:decoded.duration};
+  const a=decoded.getChannelData(0), b=decoded.getChannelData(1);
+  const out=new Float32Array(n);
+  for(let i=0;i<n;i++) out[i]=(a[i]+b[i])/2;
+  return {audio:out, duration:decoded.duration};
+}
+
+/* ---------- model loading with graceful fallback ---------- */
+async function getTranscriber(id,onProgress){
+  if(transcriber && loadedModelId===id) return transcriber;
+  if(transcriber && transcriber.dispose){ try{ await transcriber.dispose(); }catch(_){} }
+  transcriber=null;
+  const attempts = hasGPU
+    ? [{device:'webgpu',dtype:{encoder_model:'fp32',decoder_model_merged:'q8'}},
+       {device:'webgpu',dtype:'q8'},
+       {device:'wasm',dtype:'q8'}]
+    : [{device:'wasm',dtype:'q8'}];
+  let lastErr=null;
+  for(const opt of attempts){
+    try{
+      transcriber=await pipeline('automatic-speech-recognition',id,{...opt,progress_callback:onProgress});
+      loadedModelId=id;
+      backendUsed=opt.device;
+      return transcriber;
+    }catch(e){ lastErr=e; console.warn('pipeline attempt failed',opt,e); }
+  }
+  throw lastErr || new Error('Could not load the speech model.');
+}
+let backendUsed='';
+
+/* ---------- run ---------- */
+go.addEventListener('click',run);
+
+async function run(){
+  if(!currentFile) return;
+  go.disabled=true; modelSel.disabled=true;
+  prog.hidden=false; bar.removeAttribute('value'); bar.value=0;
+  const t0=performance.now();
+  try{
+    say('Reading the audio out of your file…');
+    const {audio,duration}=await extractAudio(currentFile);
+
+    say('Preparing the speech model (one-time download)…');
+    const seen={};
+    const asr=await getTranscriber(modelSel.value,p=>{
+      if(p.status==='progress' && p.total){
+        seen[p.file]=p.loaded/p.total;
+        const v=Object.values(seen);
+        const pct=Math.round(100*v.reduce((a,b)=>a+b,0)/v.length);
+        bar.value=pct;
+        say(`Downloading speech model… ${pct}%`);
+      }else if(p.status==='ready'){ say('Model ready.'); }
+    });
+
+    const total=Math.max(1,Math.ceil(duration/20));
+    let done=0;
+    bar.value=0;
+    say('Listening to the audio… this is the long part.');
+
+    const out=await asr(audio,{
+      chunk_length_s:30,
+      stride_length_s:5,
+      return_timestamps:true,
+      chunk_callback:()=>{
+        done++;
+        const pct=Math.min(99,Math.round(100*done/total));
+        bar.value=pct;
+        const elapsed=(performance.now()-t0)/1000;
+        const eta=done>1 ? Math.round(elapsed/done*(total-done)) : null;
+        say(`Transcribing… ${pct}%${eta!==null?`  ·  about ${eta<90?eta+' s':Math.round(eta/60)+' min'} left`:''}  ·  running on ${backendUsed==='webgpu'?'your graphics card':'CPU (slower)'}`);
+      }
+    });
+
+    bar.value=100;
+    cues=buildCues(out.chunks||[], duration);
+    if(!cues.length) throw new Error('No speech was detected in that file. Check that the video actually has an audio track.');
+    save();
+    review.style.display='block';
+    renderCues();
+    const secs=Math.round((performance.now()-t0)/1000);
+    say(`Done — ${cues.length} caption lines in ${secs<90?secs+' seconds':Math.round(secs/60)+' minutes'}. Now review them below.`);
+    review.scrollIntoView({behavior:'smooth',block:'start'});
+  }catch(err){
+    console.error(err);
+    prog.hidden=false;
+    progText.innerHTML='';
+    const box=document.createElement('div');
+    box.className='note err';
+    box.textContent=err.message||String(err);
+    progText.appendChild(box);
+    bar.value=0;
+  }finally{
+    go.disabled=false; modelSel.disabled=false;
+  }
+}
+function say(msg){ progText.textContent=msg; }
+
+/* ---------- turn whisper chunks into readable caption cues ---------- */
+const MAX_CHARS=84, MAX_DUR=6.5, MIN_DUR=1.0;
+
+function buildCues(chunks,duration){
+  const raw=[];
+  for(const c of chunks){
+    let [s,e]=c.timestamp||[];
+    const text=(c.text||'').replace(/\s+/g,' ').trim();
+    if(!text) continue;
+    if(s==null||!isFinite(s)) s = raw.length ? raw[raw.length-1].end : 0;
+    if(e==null||!isFinite(e)||e<=s) e = Math.min(duration||s+3, s+Math.max(1.2,text.length/15));
+    raw.push({start:s,end:e,text});
+  }
+  const out=[];
+  for(const c of raw) splitCue(c).forEach(x=>out.push(x));
+  // tidy: no overlaps, sane minimum durations
+  for(let i=0;i<out.length;i++){
+    const next=out[i+1];
+    if(out[i].end-out[i].start<MIN_DUR){
+      out[i].end=out[i].start+MIN_DUR;
+    }
+    if(next && out[i].end>next.start) out[i].end=Math.max(out[i].start+0.4,next.start-0.02);
+    if(duration && out[i].end>duration) out[i].end=duration;
+  }
+  return out;
+}
+
+function splitCue(c){
+  const dur=c.end-c.start;
+  if(c.text.length<=MAX_CHARS && dur<=MAX_DUR) return [c];
+  const pieces=segment(c.text);
+  const totalChars=pieces.reduce((a,p)=>a+p.length,0)||1;
+  let t=c.start; const out=[];
+  pieces.forEach(p=>{
+    const share=dur*(p.length/totalChars);
+    out.push({start:t,end:t+share,text:p});
+    t+=share;
+  });
+  return out;
+}
+
+// Words a caption line should not end on — breaking here splits a phrase and
+// makes the line harder to read. Standard captioning practice.
+const WEAK=new Set(('a an the and or but nor so yet of to in on at for with from into onto over under '+
+  'is are was were be been being am has have had do does did will would can could shall should may '+
+  'might must that this these those as if than then when while because about after before between '+
+  'i you he she it we they my your his her its our their not no very just more most such').split(' '));
+
+function segment(text){
+  // prefer sentence ends, then clause breaks, then length
+  const words=text.split(' ');
+  const out=[]; let cur='';
+  for(const w of words){
+    const candidate = cur ? cur+' '+w : w;
+    if(candidate.length>MAX_CHARS && cur){ out.push(cur); cur=w; continue; }
+    cur=candidate;
+    if(cur.length>=MAX_CHARS*0.55 && /[.!?]["')\]]?$/.test(w)){ out.push(cur); cur=''; }
+    else if(cur.length>=MAX_CHARS*0.8 && /[,;:]["')\]]?$/.test(w)){ out.push(cur); cur=''; }
+  }
+  if(cur) out.push(cur);
+  return rebalance(out);
+}
+
+function rebalance(pieces){
+  // 1. never end a line on a weak word — push it to the next line
+  for(let i=0;i<pieces.length-1;i++){
+    let guard=0;
+    while(guard++<3){
+      const w=pieces[i].split(' ');
+      const last=w[w.length-1].toLowerCase().replace(/[^a-z']/g,'');
+      if(w.length>2 && WEAK.has(last) && (w[w.length-1]+' '+pieces[i+1]).length<=MAX_CHARS+12){
+        pieces[i+1]=w.pop()+' '+pieces[i+1];
+        pieces[i]=w.join(' ');
+      } else break;
+    }
+  }
+  // 2. absorb a stubby tail back into the line before it
+  if(pieces.length>1){
+    const last=pieces[pieces.length-1];
+    const prev=pieces[pieces.length-2];
+    if(last.length<25 && (prev+' '+last).length<=MAX_CHARS+24){
+      pieces.splice(pieces.length-2,2,prev+' '+last);
+    }
+  }
+  return pieces.filter(p=>p.trim());
+}
+
+function wrapLines(text,max=42){
+  const words=text.replace(/\s+/g,' ').trim().split(' ');
+  const lines=[]; let cur='';
+  for(const w of words){
+    if(!cur) cur=w;
+    else if((cur+' '+w).length<=max) cur+=' '+w;
+    else { lines.push(cur); cur=w; }
+  }
+  if(cur) lines.push(cur);
+  return lines.join('\n');
+}
+
+/* ---------- cue editor ---------- */
+function renderCues(){
+  cuesEl.innerHTML='';
+  cues.forEach((c,i)=>cuesEl.appendChild(cueRow(c,i)));
+  updateStats();
+}
+
+function cueRow(c,i){
+  const row=document.createElement('div');
+  row.className='cue'; row.dataset.i=i; row.setAttribute('role','listitem');
+
+  const times=document.createElement('div');
+  times.className='times';
+  const st=timeInput(c,'start',i), en=timeInput(c,'end',i);
+  const jump=document.createElement('button');
+  jump.className='ghost tiny'; jump.textContent='▶ '+short(c.start);
+  jump.title='Play from here';
+  jump.addEventListener('click',()=>{ video.currentTime=c.start; video.play().catch(()=>{}); });
+  times.append(jump,st,en);
+
+  const ta=document.createElement('textarea');
+  ta.value=c.text;
+  ta.setAttribute('aria-label',`Caption text at ${short(c.start)}`);
+  ta.addEventListener('input',()=>{ c.text=ta.value; markLen(row,c); updateStats(); save(); });
+
+  const tools=document.createElement('div');
+  tools.className='tools';
+  tools.append(
+    mini('Merge with next',()=>{ if(i<cues.length-1){ cues[i].text=(cues[i].text+' '+cues[i+1].text).trim(); cues[i].end=cues[i+1].end; cues.splice(i+1,1); renderCues(); save(); }}),
+    mini('Split here',()=>{ splitAt(i,ta.selectionStart); }),
+    mini('Delete',()=>{ cues.splice(i,1); renderCues(); save(); })
+  );
+
+  row.append(times,ta,tools);
+  markLen(row,c);
+  return row;
+}
+function mini(label,fn){ const b=document.createElement('button'); b.className='ghost tiny'; b.textContent=label; b.addEventListener('click',fn); return b; }
+
+function timeInput(c,key,i){
+  const inp=document.createElement('input');
+  inp.type='text'; inp.value=fmt(c[key],'.').slice(0,-1);
+  const lbl=(key==='start'?'Start':'End')+' time for line '+(i+1);
+  inp.setAttribute('aria-label',lbl);
+  inp.title=lbl+' (hours:minutes:seconds.hundredths)';
+  inp.addEventListener('change',()=>{
+    const v=parseTime(inp.value);
+    if(isFinite(v)) c[key]=v;
+    inp.value=fmt(c[key],'.').slice(0,-1);
+    save(); updateStats();
+  });
+  return inp;
+}
+
+function splitAt(i,pos){
+  const c=cues[i];
+  if(!pos||pos<=0||pos>=c.text.length) return;
+  const a=c.text.slice(0,pos).trim(), b=c.text.slice(pos).trim();
+  if(!a||!b) return;
+  const dur=c.end-c.start;
+  const mid=c.start+dur*(a.length/(a.length+b.length));
+  cues.splice(i,1,{start:c.start,end:mid,text:a},{start:mid,end:c.end,text:b});
+  renderCues(); save();
+}
+
+function markLen(row,c){
+  const lines=wrapLines(c.text).split('\n');
+  const bad = c.text.length>MAX_CHARS+20 || lines.length>3;
+  row.querySelector('textarea').style.borderColor = bad ? 'var(--warn)' : '';
+}
+
+$('addEnd').addEventListener('click',()=>{
+  const last=cues[cues.length-1];
+  const s=last?last.end+0.1:0;
+  cues.push({start:s,end:s+2,text:''});
+  renderCues(); save();
+});
+
+function updateStats(){
+  const words=cues.reduce((a,c)=>a+(c.text.trim()?c.text.trim().split(/\s+/).length:0),0);
+  stats.textContent=`${cues.length} caption lines · ${words} words`;
+}
+
+/* ---------- live caption overlay ---------- */
+video.addEventListener('timeupdate',()=>{
+  const t=video.currentTime;
+  let active=-1;
+  for(let i=0;i<cues.length;i++){ if(t>=cues[i].start && t<=cues[i].end){ active=i; break; } }
+  overlay.innerHTML = active>=0 && cues[active].text.trim()
+    ? wrapLines(cues[active].text).split('\n').map(l=>`<span>${esc(l)}</span>`).join('<br>')
+    : '';
+  cuesEl.querySelectorAll('.cue.active').forEach(el=>el.classList.remove('active'));
+  if(active>=0){
+    const el=cuesEl.querySelector(`.cue[data-i="${active}"]`);
+    if(el){ el.classList.add('active'); if(!el.contains(document.activeElement)) el.scrollIntoView({block:'nearest'}); }
+  }
+});
+const esc=s=>s.replace(/[&<>]/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[m]));
+
+/* ---------- autosave ---------- */
+function save(){
+  if(!storeKey) return;
+  try{ localStorage.setItem(storeKey,JSON.stringify(cues)); saveState.textContent='Edits saved in this browser.'; }
+  catch(_){ saveState.textContent=''; }
+}
+function loadSaved(){
+  try{ const v=localStorage.getItem(storeKey); return v?JSON.parse(v):null; }catch(_){ return null; }
+}
+
+/* ---------- export ---------- */
+function baseName(){ return (currentFile?currentFile.name:'captions').replace(/\.[^.]+$/,''); }
+function usable(){ return cues.filter(c=>c.text.trim()).sort((a,b)=>a.start-b.start); }
+
+function toSRT(){
+  return usable().map((c,i)=>`${i+1}\n${fmt(c.start,',')} --> ${fmt(c.end,',')}\n${wrapLines(c.text)}\n`).join('\n');
+}
+function toVTT(){
+  return 'WEBVTT\n\n'+usable().map(c=>`${fmt(c.start,'.')} --> ${fmt(c.end,'.')}\n${wrapLines(c.text)}\n`).join('\n');
+}
+function toTXT(){
+  return usable().map(c=>c.text.trim()).join(' ').replace(/\s+/g,' ').replace(/([.!?]) /g,'$1\n\n');
+}
+function download(text,ext,mime){
+  const blob=new Blob([text],{type:mime+';charset=utf-8'});
+  const a=document.createElement('a');
+  a.href=URL.createObjectURL(blob);
+  a.download=baseName()+ext;
+  document.body.appendChild(a); a.click();
+  setTimeout(()=>{ URL.revokeObjectURL(a.href); a.remove(); },1500);
+}
+$('dlSrt').addEventListener('click',()=>download(toSRT(),'.srt','text/plain'));
+$('dlVtt').addEventListener('click',()=>download(toVTT(),'.vtt','text/vtt'));
+$('dlTxt').addEventListener('click',()=>download(toTXT(),'.txt','text/plain'));
+
+/* ---------- expose a few internals for automated smoke testing ---------- */
+window.__caption = { buildCues, splitCue, segment, wrapLines, fmt, toSRT, parseTime,
+                     setCues:c=>{cues=c;}, getCues:()=>cues };
+window.__ready = true;
+</script>
+</body>
+</html>
