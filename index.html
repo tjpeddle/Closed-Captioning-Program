@@ -144,6 +144,10 @@
     <div id="prog" hidden style="margin-top:14px">
       <progress id="bar" max="100" value="0"></progress>
       <div id="progText" class="hint" role="status" aria-live="polite"></div>
+      <div id="bailWrap" hidden style="margin-top:10px">
+        <button id="bail" class="ghost">Stuck? Switch to compatibility mode and restart the page</button>
+        <div class="hint">Compatibility mode uses the CPU instead of the graphics card. The page reloads, so you will add your files again — the model stays cached.</div>
+      </div>
     </div>
   </div>
 
@@ -228,13 +232,49 @@ const MODELS={
 
 let queue=[], current=null, cues=[], transcriber=null, loadedModelId=null, running=false;
 
-/* ---------- environment check ---------- */
-const hasGPU = !!navigator.gpu;
-if(!hasGPU){
-  compat.hidden=false;
-  compat.className='note warn';
-  compat.innerHTML='<strong>Heads up:</strong> this browser does not offer WebGPU, so captioning will run in a slower fallback mode (roughly real&#8209;time or worse). For long lectures, use <strong>Chrome</strong> or <strong>Edge</strong> on a desktop computer, or pick the "Draft" accuracy setting.';
+/* ---------- environment check ----------
+   navigator.gpu existing is NOT enough: on machines with graphics
+   acceleration disabled or a blocklisted GPU, Chrome backs WebGPU with a
+   software emulator (SwiftShader) that is slower than plain CPU and can look
+   hung. Probe the adapter and refuse software GPUs. */
+const FORCE_CPU_KEY='capstudio:forceCpu';
+let hasGPU=false, backendUsed='';
+
+async function detectGPU(){
+  try{
+    if(new URLSearchParams(location.search).has('cpu')) localStorage.setItem(FORCE_CPU_KEY,'1');
+  }catch(_){}
+  let forced=false;
+  try{ forced=localStorage.getItem(FORCE_CPU_KEY)==='1'; }catch(_){}
+  if(forced) return {ok:false, why:'compatibility mode is switched on', forced:true};
+  try{
+    if(!navigator.gpu) return {ok:false, why:'this browser does not offer WebGPU'};
+    const ad=await navigator.gpu.requestAdapter();
+    if(!ad) return {ok:false, why:'no usable graphics adapter was offered'};
+    let info={};
+    try{ info=ad.info || (ad.requestAdapterInfo ? await ad.requestAdapterInfo() : {}); }catch(_){}
+    const desc=[info.vendor,info.architecture,info.device,info.description].filter(Boolean).join(' ');
+    if(ad.isFallbackAdapter || /swiftshader|llvmpipe|software|basic render/i.test(desc)){
+      return {ok:false, why:'Chrome is only offering a software-emulated graphics device'+(desc?' ('+desc+')':'')+', which is slower than the CPU and can stall', soft:true};
+    }
+    return {ok:true};
+  }catch(_){ return {ok:false, why:'the graphics check failed'}; }
 }
+
+const gpuCheck=detectGPU().then(r=>{
+  hasGPU=r.ok;
+  if(!r.ok){
+    compat.hidden=false;
+    compat.className='note warn';
+    let msg='<strong>Running in CPU mode:</strong> '+r.why+'. Captioning still works — it is just slower (roughly the length of the video, sometimes more). On this computer the <strong>Quick</strong> accuracy setting is a sensible trade: about 3&times; faster, still a solid draft to edit. ';
+    if(r.soft) msg+='This usually means graphics acceleration is disabled: open <code>chrome://settings/system</code>, turn on &ldquo;Use graphics acceleration when available&rdquo;, relaunch Chrome, and reload this page. On a university-managed computer, IT may control that setting. ';
+    if(r.forced) msg+='<button id="unforce" class="ghost tiny" style="margin-left:6px">Turn the fast mode back on</button>';
+    compat.innerHTML=msg;
+    const un=document.getElementById('unforce');
+    if(un) un.addEventListener('click',()=>{ try{localStorage.removeItem(FORCE_CPU_KEY);}catch(_){} location.href=location.pathname; });
+  }
+  return r;
+});
 
 /* ---------- time helpers ---------- */
 const pad=(n,l=2)=>String(Math.max(0,n)).padStart(l,'0');
@@ -366,7 +406,6 @@ async function getTranscriber(id,onProgress){
   }
   throw lastErr || new Error('Could not load the speech model.');
 }
-let backendUsed='';
 
 /* ---------- silence skipping ----------
    Lectures are full of pauses. Cut every quiet stretch longer than ~0.8 s
@@ -429,6 +468,7 @@ async function run(){
   prog.hidden=false; bar.removeAttribute('value'); bar.value=0;
   progText.innerHTML='';
   try{
+    await gpuCheck;
     say('Preparing the speech model (one-time download)…');
     const seen={};
     const asr=await getTranscriber(modelSel.value,p=>{
@@ -489,7 +529,11 @@ async function transcribeItem(item, asr, label){
       say(`${label}Reading the audio out of ${item.file.name}… ${s}s`);
       item.note='reading audio… '+s+'s'; renderQueue();
     }else if(stageName==='warm' && !gotChunk){
-      say(`${label}Model is working on the first stretch of audio… ${s}s — the first chunk includes one-time warm-up and is by far the slowest. It speeds up after this.`);
+      const eng=backendUsed==='webgpu'?'graphics card':'CPU (slow mode)';
+      let extra='';
+      if(s>150) extra=' This is longer than it should be — if nothing changes in the next minute, use the button below.';
+      say(`${label}Model is working on the first stretch of audio on your ${eng}… ${s}s — the first chunk includes one-time warm-up and is by far the slowest. It speeds up after this.${extra}`);
+      if(s>150 && backendUsed==='webgpu') $('bailWrap').hidden=false;
       item.note='warming up… '+s+'s'; renderQueue();
     }
   },1000);
@@ -523,6 +567,7 @@ async function transcribeItem(item, asr, label){
       return_timestamps:true,
       chunk_callback:()=>{
         gotChunk=true;
+        $('bailWrap').hidden=true;
         done++;
         const pct=Math.min(99,Math.round(100*done/total));
         bar.value=pct;
@@ -722,6 +767,11 @@ function markLen(row,c){
   const bad = c.text.length>MAX_CHARS+20 || lines.length>3;
   row.querySelector('textarea').style.borderColor = bad ? 'var(--warn)' : '';
 }
+
+$('bail').addEventListener('click',()=>{
+  try{ localStorage.setItem(FORCE_CPU_KEY,'1'); }catch(_){}
+  location.reload();
+});
 
 $('addEnd').addEventListener('click',()=>{
   const last=cues[cues.length-1];
