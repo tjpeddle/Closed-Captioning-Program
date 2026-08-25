@@ -66,9 +66,11 @@
   .vidbox{position:relative;background:#000;border-radius:10px;overflow:hidden}
   video{width:100%;display:block;max-height:44vh;background:#000}
   #overlay{
-    position:absolute;left:0;right:0;bottom:52px;text-align:center;pointer-events:none;
+    position:absolute;left:0;right:0;bottom:12px;text-align:center;pointer-events:none;
     font-size:clamp(14px,2.2vw,20px);line-height:1.35;padding:0 6%;
+    transition:bottom .15s;
   }
+  .vidbox:hover #overlay,.vidbox.paused #overlay{bottom:58px} /* clear the control bar when it is visible */
   #overlay span{background:rgba(0,0,0,.82);color:#fff;padding:3px 9px;border-radius:4px;box-decoration-break:clone;-webkit-box-decoration-break:clone}
   #cues{max-height:52vh;overflow:auto;border:1px solid var(--line);border-radius:10px}
   .cue{display:grid;grid-template-columns:104px 1fr;gap:10px;padding:9px 10px;border-bottom:1px solid var(--line)}
@@ -158,11 +160,12 @@
       <div class="note warn">Automatic speech recognition typically gets 90&ndash;95% of words right. For a student who relies on captions, please skim every line: fix names, course terms, and numbers, and add sound cues like <code>[laughter]</code> or <code>[video plays]</code> where they carry meaning. Click any timestamp to jump the video there.</div>
       <div class="grid" style="margin-top:14px">
         <div>
-          <div class="vidbox">
+          <div class="vidbox" id="vidbox">
             <video id="video" controls preload="metadata"></video>
             <div id="overlay" aria-hidden="true"></div>
           </div>
           <div class="hint" id="stats"></div>
+          <div class="hint">Caption position here is only a preview. In the student&rsquo;s own player the captions sit at the bottom of the picture, and most players let them be moved and resized.</div>
         </div>
         <div>
           <div id="cues" role="list" aria-label="Caption lines"></div>
@@ -181,8 +184,10 @@
         <button id="dlVtt" class="ghost">Download .vtt</button>
         <button id="dlTxt" class="ghost">Download transcript (.txt)</button>
         <button id="dlAll" class="ghost" hidden>Download .srt for every finished video</button>
+        <button id="dlMp4" class="ghost">Download .mp4 with captions built in</button>
       </div>
-      <div class="hint">Use <strong>.srt</strong> for Canvas Studio, Panopto, YouTube and VLC. Use <strong>.vtt</strong> for a web page or an HTML5 <code>&lt;video&gt;</code> tag. Upload the caption file next to the video &mdash; that way the student can turn captions on, resize them, and search the text.</div>
+      <div class="hint" id="mp4Status" role="status" aria-live="polite"></div>
+      <div class="hint">Use <strong>.srt</strong> for Canvas Studio, Panopto, YouTube and VLC. Use <strong>.vtt</strong> for a web page or an HTML5 <code>&lt;video&gt;</code> tag. Upload the caption file next to the video &mdash; that way the student can turn captions on, resize them, and search the text. The <strong>.mp4 with captions built in</strong> is one file with a real caption track (not burned-in) &mdash; it plays with captions in VLC, QuickTime, and the Windows Media Player, and the student can still turn them off or restyle them.</div>
     </div>
   </div>
 
@@ -229,11 +234,24 @@ if(location.protocol==='https:' && 'serviceWorker' in navigator && !crossOriginI
     }
   }).catch(()=>{});
 }
+let wasmThreads=1;
 if(self.crossOriginIsolated){
   try{
-    env.backends.onnx.wasm.numThreads=Math.min(Math.max(2,(navigator.hardwareConcurrency||4)-2),8);
-  }catch(_){}
+    wasmThreads=Math.min(Math.max(2,(navigator.hardwareConcurrency||4)-2),8);
+    env.backends.onnx.wasm.numThreads=wasmThreads;
+  }catch(_){ wasmThreads=1; }
 }
+/* If the helper never activates, say so plainly — a single-core CPU run is
+   the difference between minutes and the better part of an hour. */
+setTimeout(()=>{
+  if(location.protocol!=='https:' || self.crossOriginIsolated) return;
+  const w=document.createElement('div');
+  w.className='note warn';
+  w.style.marginTop='10px';
+  w.innerHTML='<strong>Speed helper not active:</strong> the <code>coi-sw.js</code> file is missing from the repository or failed to load, so the CPU engine can only use <strong>one</strong> processor core instead of all of them. Upload <code>coi-sw.js</code> into the same folder as <code>index.html</code>, then hard-refresh this page (Ctrl+Shift+R).';
+  const c=document.getElementById('compat');
+  c.parentNode.insertBefore(w,c.nextSibling);
+},6000);
 
 /* ---------- element handles ---------- */
 const $ = id => document.getElementById(id);
@@ -573,9 +591,14 @@ async function run(){
   }
 }
 
+function engineLabel(){
+  return backendUsed==='webgpu' ? 'your graphics card'
+       : `the CPU (${wasmThreads>1 ? wasmThreads+' cores' : 'single core — slow; is coi-sw.js installed?'})`;
+}
+
 async function transcribeItem(item, asr, label){
   const t0=performance.now();
-  let stageName='read', gotChunk=false;
+  let stageName='read', gotChunk=false, lastProgress=performance.now(), lastStatus='';
 
   // Heartbeat: some stages (audio decode, first-chunk model warm-up) give no
   // progress events at all, so tick a visible timer — the page must never
@@ -586,12 +609,16 @@ async function transcribeItem(item, asr, label){
       say(`${label}Reading the audio out of ${item.file.name}… ${s}s`);
       item.note='reading audio… '+s+'s'; renderQueue();
     }else if(stageName==='warm' && !gotChunk){
-      const eng=backendUsed==='webgpu'?'graphics card':'CPU (slow mode)';
       let extra='';
-      if(s>150) extra=' This is longer than it should be — if nothing changes in the next minute, use the button below.';
-      say(`${label}Model is working on the first stretch of audio on your ${eng}… ${s}s — the first chunk includes one-time warm-up and is by far the slowest. It speeds up after this.${extra}`);
+      if(s>150) extra=backendUsed==='webgpu'
+        ? ' This is longer than it should be — if nothing changes in the next minute, use the button below.'
+        : ' A single-core CPU run really is this slow — installing the coi-sw.js helper next to index.html unlocks all cores.';
+      say(`${label}Model is working on the first stretch of audio on ${engineLabel()}… ${s}s — the first chunk includes one-time warm-up and is by far the slowest. It speeds up after this.${extra}`);
       if(s>150 && backendUsed==='webgpu') $('bailWrap').hidden=false;
       item.note='warming up… '+s+'s'; renderQueue();
+    }else if(stageName==='warm' && gotChunk){
+      const idle=Math.round((performance.now()-lastProgress)/1000);
+      if(idle>15 && lastStatus) say(`${lastStatus}  ·  still crunching, ${idle}s into the current chunk`);
     }
   },1000);
 
@@ -625,13 +652,15 @@ async function transcribeItem(item, asr, label){
       chunk_callback:()=>{
         gotChunk=true;
         $('bailWrap').hidden=true;
+        lastProgress=performance.now();
         done++;
         const pct=Math.min(99,Math.round(100*done/total));
         bar.value=pct;
         item.note='transcribing '+pct+'%'; renderQueue();
         const elapsed=(performance.now()-t0)/1000;
         const eta=done>1?Math.round(elapsed/done*(total-done)):null;
-        say(`${label}Transcribing… ${pct}%${eta!==null?`  ·  about ${eta<90?eta+' s':Math.round(eta/60)+' min'} left`:''}  ·  on ${backendUsed==='webgpu'?'your graphics card':'CPU (slower — use Chrome or Edge for the fast path)'}${skipNote}`);
+        lastStatus=`${label}Transcribing… ${pct}%${eta!==null?`  ·  about ${eta<90?eta+' s':Math.round(eta/60)+' min'} left`:''}  ·  on ${engineLabel()}${skipNote}`;
+        say(lastStatus);
       }
     });
     clearInterval(beat);
@@ -843,6 +872,8 @@ function updateStats(){
 }
 
 /* ---------- live caption overlay ---------- */
+video.addEventListener('pause',()=>$('vidbox').classList.add('paused'));
+video.addEventListener('play',()=>$('vidbox').classList.remove('paused'));
 video.addEventListener('timeupdate',()=>{
   const t=video.currentTime;
   let active=-1;
@@ -896,6 +927,95 @@ $('dlTxt').addEventListener('click',()=>download(toTXT(),nameFor(current&&curren
 $('dlAll').addEventListener('click',()=>{
   const done=queue.filter(q=>q.status==='done'&&q.cues&&q.cues.length);
   done.forEach((q,i)=>setTimeout(()=>download(toSRT(q.cues),nameFor(q.file)+'.srt','text/plain'),i*400));
+});
+
+/* ---------- captioned MP4 export ----------
+   Repackages the original video into an MP4 with the captions embedded as a
+   proper caption track (mov_text) — no re-encoding, so it takes seconds, the
+   quality is untouched, and the student can still toggle or restyle the
+   captions. Runs on ffmpeg.wasm, loaded on first use. */
+const FF_BASE = window.__FF_BASE || {
+  ffmpeg:'https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.12.15/dist/esm',
+  core:'https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.10/dist/esm'
+};
+let ffmpegInst=null;
+async function toBlobURL(url,type){
+  const r=await fetch(url);
+  if(!r.ok) throw new Error('Could not download the video toolkit ('+url.split('/').pop()+').');
+  return URL.createObjectURL(new Blob([await r.arrayBuffer()],{type}));
+}
+async function getFFmpeg(onMsg){
+  if(ffmpegInst) return ffmpegInst;
+  onMsg('Downloading the video toolkit (one time, ~32 MB — cached afterwards)…');
+  const abs=new URL(FF_BASE.ffmpeg, location.href).href.replace(/\/$/,'');
+  const {FFmpeg}=await import(abs+'/index.js');
+  const ff=new FFmpeg();
+  // A worker cannot be constructed straight from another origin, so wrap the
+  // real worker in a tiny same-origin module that imports it. Its own relative
+  // imports still resolve against the CDN, which is what we want.
+  const shim=URL.createObjectURL(new Blob(
+    [`import ${JSON.stringify(abs+'/worker.js')};`],{type:'text/javascript'}));
+  await ff.load({
+    classWorkerURL:shim,
+    coreURL:await toBlobURL(FF_BASE.core+'/ffmpeg-core.js','text/javascript'),
+    wasmURL:await toBlobURL(FF_BASE.core+'/ffmpeg-core.wasm','application/wasm'),
+  });
+  ffmpegInst=ff;
+  return ff;
+}
+const mp4Status=$('mp4Status');
+let muxBusy=false;
+$('dlMp4').addEventListener('click',async ()=>{
+  if(muxBusy) return;
+  if(!current || !current.cues || !current.cues.filter(c=>c.text.trim()).length){
+    mp4Status.textContent='Generate and review captions for a video first, then come back to this button.';
+    return;
+  }
+  const f=current.file;
+  if(!/^video\//.test(f.type) && !/\.(mp4|m4v|mov|webm|mkv)$/i.test(f.name)){
+    mp4Status.textContent='This file is audio-only — there is no video to package. Use the .srt or transcript instead.';
+    return;
+  }
+  if(f.size>700*1048576){
+    mp4Status.textContent='This video is too large to repackage in the browser (limit ~700 MB). Use the .srt file next to the video instead — VLC picks it up automatically when both share a name.';
+    return;
+  }
+  muxBusy=true; $('dlMp4').disabled=true;
+  try{
+    const ff=await getFFmpeg(m=>mp4Status.textContent=m);
+    mp4Status.textContent='Packaging '+f.name+' with its captions… (no re-encoding — usually well under a minute)';
+    const inName='in_'+f.name.replace(/[^A-Za-z0-9._-]/g,'_');
+    await ff.writeFile(inName, new Uint8Array(await f.arrayBuffer()));
+    await ff.writeFile('caps.srt', new TextEncoder().encode(toSRT(current.cues)));
+    // MP4 first; VP8/VP9/Opus sources (.webm) cannot go in an MP4 without
+    // re-encoding, so fall back to MKV, which takes any codec and plays in VLC.
+    const common=['-map','0:v:0','-map','0:a:0?','-map','1:0','-c','copy',
+                  '-metadata:s:s:0','language=eng','-disposition:s:0','default'];
+    let outName='out.mp4', mime='video/mp4', ext='.mp4';
+    let code=await ff.exec(['-i',inName,'-i','caps.srt',...common,'-c:s','mov_text','-movflags','+faststart',outName]);
+    if(code!==0){
+      mp4Status.textContent='That video uses a format MP4 cannot hold — packaging it as .mkv instead (plays in VLC)…';
+      outName='out.mkv'; mime='video/x-matroska'; ext='.mkv';
+      code=await ff.exec(['-i',inName,'-i','caps.srt',...common,'-c:s','srt',outName]);
+    }
+    if(code!==0) throw new Error('remux failed');
+    const data=await ff.readFile(outName);
+    const blob=new Blob([data.buffer],{type:mime});
+    const a=document.createElement('a');
+    a.href=URL.createObjectURL(blob);
+    a.download=nameFor(f)+'-captioned'+ext;
+    document.body.appendChild(a); a.click();
+    setTimeout(()=>{URL.revokeObjectURL(a.href);a.remove();},1500);
+    mp4Status.textContent='Done — '+nameFor(f)+'-captioned'+ext+' is in your downloads. Captions are on by default in VLC; other players show them under the subtitle or CC menu.';
+    try{ await ff.deleteFile(inName); await ff.deleteFile('caps.srt'); await ff.deleteFile(outName); }catch(_){}
+  }catch(err){
+    console.error(err);
+    mp4Status.textContent=(err&&err.message&&err.message.startsWith('Could not download'))
+      ? err.message
+      : 'This video’s format could not be repackaged as MP4 without re-encoding (common for .webm and some phone recordings). Convert it to MP4 (H.264/AAC) first, or share the .srt next to the video — VLC pairs them automatically when the names match.';
+  }finally{
+    muxBusy=false; $('dlMp4').disabled=false;
+  }
 });
 
 /* ---------- expose a few internals for automated smoke testing ---------- */
