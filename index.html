@@ -997,16 +997,27 @@ $('dlBurn').addEventListener('click',async ()=>{
   const t0=performance.now();
   let mounted=false, ff=null;
   try{
-    ff=await getFFmpeg(m=>mp4Status.textContent=m,true);
-    mp4Status.innerHTML='Preparing…';
+    // The single-core engine is the dependable one: the multi-core build is
+    // faster in theory but crashes on some machines, and a wrong answer that
+    // takes an hour is worse than a right one that takes the length of the video.
+    mp4Status.innerHTML='Starting the video engine…';
+    ff=await getFFmpeg(m=>mp4Status.textContent=m,false);
+
+    mp4Status.innerHTML='Opening '+esc(f.name)+'…';
     try{ await ff.createDir('/src'); }catch(_){}
     try{
       await ff.mount(FFFS.WORKERFS,{files:[f]},'/src');
       mounted=true;
-    }catch(_){
+    }catch(err){
+      console.warn('mount failed',err);
+      // Loading a huge file into memory instead would stall for minutes and
+      // probably run out of memory. Say so rather than appearing to hang.
+      if(mb>600) throw new Error('mount-failed-big');
+      mp4Status.innerHTML='Reading the video into memory…';
       await ff.writeFile('src.bin',new Uint8Array(await f.arrayBuffer()));
     }
     const inName = mounted ? '/src/'+f.name : 'src.bin';
+    mp4Status.innerHTML='Adding the caption text…';
     await ff.writeFile('caps.srt', new TextEncoder().encode(toSRT()));
 
     // progress: ffmpeg reports how far through the timeline it is
@@ -1034,10 +1045,28 @@ $('dlBurn').addEventListener('click',async ()=>{
       '-c:v','libx264','-preset','veryfast','-crf','24','-pix_fmt','yuv420p',
       '-c:a','aac','-b:a','128k','-movflags','+faststart','burned.mp4'];
     ffLog.length=0;
+
+    // Nothing here reports progress until the encoder produces its first
+    // frame, which on a large file can take a while. Tick a visible clock so
+    // working never looks the same as frozen.
+    let started=false;
+    const t1=performance.now();
+    const beat=setInterval(()=>{
+      if(started) return;
+      const s=Math.round((performance.now()-t1)/1000);
+      mp4Status.innerHTML='<strong>Reading the video and starting the encoder… '+s+'s</strong>'+
+        (s>120?'<br><span class="hint">Longer than expected for this step. If nothing changes by about 4 minutes, this video is probably too large for the browser — shrink it in HandBrake first, or use the caption files instead.</span>'
+              :'<br><span class="hint">A large file takes a minute or two to get going.</span>');
+    },1000);
+    const markStarted=()=>{ started=true; clearInterval(beat); };
+    ff.on('progress',markStarted);
+
     let code;
     try{
       code=await ff.exec(args);
     }catch(err){ console.warn('encode threw',err); code=1; }
+    clearInterval(beat);
+    try{ ff.off('progress',markStarted); }catch(_){}
     try{ ff.off('progress',onProg); }catch(_){}
 
     // The multi-core build is faster but not available everywhere; if it
@@ -1089,6 +1118,7 @@ $('dlBurn').addEventListener('click',async ()=>{
     showDiag();
     mp4Status.textContent =
       m==='no-font' ? 'The caption font could not be installed into the video toolkit, so the captions would have come out invisible. Reload the page and try again.' :
+      m==='mount-failed-big' ? 'The browser could not open a video this large for editing. Shrink it in HandBrake first (RF 24, 720p) — that also makes the captioning much faster — or use the caption files instead.' :
       /out of memory|Cannot enlarge|allocat|OOM/i.test(m+' '+reason)
       ? 'This computer ran out of memory on a video this large. Try the 720p setting, close other browser tabs, or shrink the video in HandBrake first.'
       : 'Could not burn the captions in.'+(reason?' ffmpeg reported: “'+reason+'”.':'')+' Try the 720p setting, or use the caption files instead.';
