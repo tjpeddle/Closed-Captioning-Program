@@ -186,8 +186,20 @@
         <button id="dlAll" class="ghost" hidden>Download .srt for every finished video</button>
         <button id="dlMp4" class="ghost">Download .mp4 with captions built in</button>
       </div>
+      <div class="bar" style="align-items:flex-end">
+        <div style="display:flex;flex-direction:column;gap:5px">
+          <label for="burnSize">Size</label>
+          <select id="burnSize">
+            <option value="720" selected>720p &mdash; faster, much smaller file</option>
+            <option value="1080">1080p &mdash; slower, larger file</option>
+            <option value="0">Keep original size &mdash; slowest</option>
+          </select>
+        </div>
+        <button id="dlBurn">★ Make video with captions on the picture</button>
+      </div>
+      <div class="hint">This is the one that works everywhere &mdash; the captions are part of the picture, so every player, phone, Blackboard and shared link shows them with nothing to switch on. It re-encodes the video, so allow a few minutes.</div>
       <div class="bar">
-        <button id="dlPack">⭐ Download share pack (.zip) &mdash; works everywhere</button>
+        <button id="dlPack" class="ghost">Download caption files (.zip) &mdash; for Blackboard&rsquo;s CC button</button>
       </div>
       <div class="hint" id="mp4Status" role="status" aria-live="polite"></div>
       <div class="bar" id="diagWrap" hidden style="margin-top:6px">
@@ -938,6 +950,152 @@ $('dlAll').addEventListener('click',()=>{
   done.forEach((q,i)=>setTimeout(()=>download(toSRT(q.cues),nameFor(q.file)+'.srt','text/plain'),i*400));
 });
 
+/* ---------- burned-in captions ----------
+   The captions become part of the picture, so nothing has to be switched on
+   and no player, platform or phone can fail to show them. Costs a re-encode,
+   which is why the video is scaled down by default: it is much faster and the
+   file ends up far smaller than the original. */
+function burnStyle(h){
+  // Scale the text with the picture; box background keeps it readable on any
+  // footage. FontName must match the font actually loaded into the toolkit.
+  const size=Math.max(18,Math.round((h||720)/30));
+  return "FontName=DejaVu Sans,Fontsize="+size+",PrimaryColour=&H00FFFFFF,"+
+         "OutlineColour=&HA0000000,BackColour=&HA0000000,BorderStyle=3,"+
+         "Outline=2,Shadow=0,MarginV="+Math.round((h||720)/22)+",Bold=1";
+}
+async function loadFont(ff,onMsg){
+  try{
+    await ff.createDir('/fonts');
+  }catch(_){}
+  try{
+    const r=await fetch(FF_BASE.font);
+    if(!r.ok) throw new Error('font fetch '+r.status);
+    await ff.writeFile('/fonts/DejaVuSans-Bold.ttf', new Uint8Array(await r.arrayBuffer()));
+    return true;
+  }catch(err){
+    console.warn('could not load a font for burned-in captions',err);
+    return false;
+  }
+}
+$('dlBurn').addEventListener('click',async ()=>{
+  if(muxBusy) return;
+  if(!current || !usable().length){
+    mp4Status.textContent='Generate and review captions for a video first.';
+    return;
+  }
+  const f=current.file;
+  if(!/^video\//.test(f.type) && !/\.(mp4|m4v|mov|webm|mkv|avi)$/i.test(f.name)){
+    mp4Status.textContent='This file is audio-only — there is no picture to put captions on.';
+    return;
+  }
+  muxBusy=true; $('dlBurn').disabled=true; $('dlMp4').disabled=true;
+  $('diagWrap').hidden=true; $('diagNote').textContent='';
+  const t0=performance.now();
+  let mounted=false, ff=null;
+  try{
+    ff=await getFFmpeg(m=>mp4Status.textContent=m,true);
+    mp4Status.innerHTML='Preparing…';
+    try{ await ff.createDir('/src'); }catch(_){}
+    try{
+      await ff.mount(FFFS.WORKERFS,{files:[f]},'/src');
+      mounted=true;
+    }catch(_){
+      await ff.writeFile('src.bin',new Uint8Array(await f.arrayBuffer()));
+    }
+    const inName = mounted ? '/src/'+f.name : 'src.bin';
+    await ff.writeFile('caps.srt', new TextEncoder().encode(toSRT()));
+
+    // progress: ffmpeg reports how far through the timeline it is
+    const dur=(current.cues.length?current.cues[current.cues.length-1].end:0)||0;
+    const onProg=({progress,time})=>{
+      const pct=Math.max(0,Math.min(99,Math.round((progress||0)*100)));
+      bar.value=pct;
+      const el=(performance.now()-t0)/1000;
+      const eta=pct>3?Math.round(el/pct*(100-pct)):null;
+      mp4Status.innerHTML='<strong>Burning captions into the picture… '+pct+'%</strong>'+
+        (eta!==null?'  ·  about '+(eta<90?eta+' seconds':Math.round(eta/60)+' minutes')+' left':'')+
+        '  ·  '+(ffIsMT?'using all processor cores':'single core — slower')+
+        '<br><span class="hint">Leave this tab open. The finished file plays with captions everywhere, with nothing to switch on.</span>';
+    };
+    ff.on('progress',onProg);
+    prog.hidden=false; bar.value=0;
+
+    mp4Status.innerHTML='Loading a font for the captions…';
+    const gotFont=await loadFont(ff);
+    if(!gotFont) throw new Error('no-font');
+
+    const size=$('burnSize').value;
+    const h=size==='0'?(video.videoHeight||720):parseInt(size,10);
+    const vf=(size==='0'?'':'scale=-2:'+size+',')+
+      "subtitles=caps.srt:fontsdir=/fonts:force_style='"+burnStyle(h)+"'";
+    const args=['-i',inName,'-vf',vf,
+      '-c:v','libx264','-preset','veryfast','-crf','24','-pix_fmt','yuv420p',
+      '-c:a','aac','-b:a','128k','-movflags','+faststart','burned.mp4'];
+    ffLog.length=0;
+    let code;
+    try{
+      code=await ff.exec(args);
+    }catch(err){ console.warn('encode threw',err); code=1; }
+    try{ ff.off('progress',onProg); }catch(_){}
+
+    // The multi-core build is faster but not available everywhere; if it
+    // stumbles, rebuild on the dependable single-core one and run again.
+    if(code!==0 && ffIsMT){
+      console.warn('multi-core encode failed, retrying on single core');
+      mp4Status.innerHTML='Switching to the dependable single-core engine and starting again…';
+      try{ if(mounted) await ff.unmount('/src'); }catch(_){}
+      try{ ff.terminate(); }catch(_){}
+      ffmpegInst=null; mounted=false;
+      ff=await getFFmpeg(m=>mp4Status.textContent=m,false);
+      try{ await ff.createDir('/src'); }catch(_){}
+      try{ await ff.mount(FFFS.WORKERFS,{files:[f]},'/src'); mounted=true; }
+      catch(_){ await ff.writeFile('src.bin',new Uint8Array(await f.arrayBuffer())); }
+      await ff.writeFile('caps.srt', new TextEncoder().encode(toSRT()));
+      if(!await loadFont(ff)) throw new Error('no-font');
+      ff.on('progress',onProg);
+      ffLog.length=0;
+      try{ code=await ff.exec(args); }catch(err){ console.warn('single-core encode threw',err); code=1; }
+      try{ ff.off('progress',onProg); }catch(_){}
+    }
+    if(code!==0){
+      const why=ffReason();
+      lastDiag='burn-in failed\nffmpeg: '+(why||'(none)')+'\n\n'+ffLog.slice(-40).join('\n');
+      throw new Error('burn failed'+(why?': '+why:''));
+    }
+    bar.value=100;
+    const data=await ff.readFile('burned.mp4');
+    if(!data||data.length<2048) throw new Error('burn produced an empty file');
+    const sig=String.fromCharCode(...data.slice(4,8));
+    if(sig!=='ftyp') throw new Error('burn produced an unreadable file');
+
+    const outFile=nameFor(f)+'-CAPTIONS.mp4';
+    const a=document.createElement('a');
+    a.href=URL.createObjectURL(new Blob([data],{type:'video/mp4'}));
+    a.download=outFile;
+    document.body.appendChild(a); a.click();
+    setTimeout(()=>{URL.revokeObjectURL(a.href);a.remove();},2000);
+    const secs=Math.round((performance.now()-t0)/1000);
+    mp4Status.innerHTML='<strong>Done — '+esc(outFile)+' is in your downloads.</strong> '+
+      (data.length/1048576).toFixed(data.length<104857600?1:0)+' MB'+
+      (data.length<f.size*0.6?' (down from '+(f.size/1048576).toFixed(0)+' MB)':'')+
+      ', made in '+(secs<90?secs+' seconds':Math.round(secs/60)+' minutes')+'. '+
+      'The captions are part of the picture, so it plays with captions in Blackboard, on phones, in any player, from any link — nothing to switch on.';
+    try{ await ff.deleteFile('burned.mp4'); await ff.deleteFile('caps.srt'); }catch(_){}
+  }catch(err){
+    console.error(err);
+    const m=(err&&err.message)||'', reason=ffReason();
+    showDiag();
+    mp4Status.textContent =
+      m==='no-font' ? 'Could not download the caption font, so the captions would have come out invisible. Check the internet connection and try again.' :
+      /out of memory|Cannot enlarge|allocat|OOM/i.test(m+' '+reason)
+      ? 'This computer ran out of memory on a video this large. Try the 720p setting, close other browser tabs, or shrink the video in HandBrake first.'
+      : 'Could not burn the captions in.'+(reason?' ffmpeg reported: “'+reason+'”.':'')+' Try the 720p setting, or use the caption files instead.';
+  }finally{
+    if(mounted){ try{ await ff.unmount('/src'); }catch(_){} }
+    muxBusy=false; $('dlBurn').disabled=false; $('dlMp4').disabled=false;
+  }
+});
+
 /* ---------- share pack ----------
    One click, one small ZIP: the captions in both standard formats, a
    self-contained player page that gives a real CC button on any host, and
@@ -1092,7 +1250,12 @@ $('dlPack').addEventListener('click',()=>{
    captions. Runs on ffmpeg.wasm, loaded on first use. */
 const FF_BASE = window.__FF_BASE || {
   ffmpeg:'https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.12.15/dist/esm',
-  core:'https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.10/dist/esm'
+  core:'https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.10/dist/esm',
+  // Multi-core build — only usable when coi-sw.js has isolated the page.
+  coremt:'https://cdn.jsdelivr.net/npm/@ffmpeg/core-mt@0.12.10/dist/esm',
+  // The video toolkit ships with no fonts at all, so burned-in captions would
+  // render as nothing. This font gets loaded into it before drawing.
+  font:'https://cdn.jsdelivr.net/npm/dejavu-fonts-ttf@2.37.3/ttf/DejaVuSans-Bold.ttf'
 };
 let ffmpegInst=null;
 const ffLog=[];
@@ -1109,15 +1272,20 @@ async function toBlobURL(url,type){
   if(!r.ok) throw new Error('Could not download the video toolkit ('+url.split('/').pop()+').');
   return URL.createObjectURL(new Blob([await r.arrayBuffer()],{type}));
 }
-let FFFS=null;
-async function getFFmpeg(onMsg){
-  if(ffmpegInst) return ffmpegInst;
+let FFFS=null, ffIsMT=false;
+async function getFFmpeg(onMsg,wantMT){
+  // Encoding wants every core; remuxing does not. Swap cores when the need
+  // changes, since the multi-core build only works on an isolated page.
+  const useMT = !!wantMT && !!self.crossOriginIsolated;
+  if(ffmpegInst && ffIsMT===useMT) return ffmpegInst;
+  if(ffmpegInst){ try{ ffmpegInst.terminate(); }catch(_){} ffmpegInst=null; }
   onMsg('Downloading the video toolkit (one time, ~32 MB — cached afterwards)…');
   const abs=new URL(FF_BASE.ffmpeg, location.href).href.replace(/\/$/,'');
   const mod=await import(abs+'/index.js');
   const {FFmpeg}=mod;
   try{ FFFS=(await import(abs+'/types.js')).FFFSType; }catch(_){ FFFS={WORKERFS:'WORKERFS'}; }
   const ff=new FFmpeg();
+  ffIsMT=useMT;
   ff.on('log',({message})=>{
     ffLog.push(message);
     if(ffLog.length>400) ffLog.shift();
@@ -1128,11 +1296,23 @@ async function getFFmpeg(onMsg){
   // imports still resolve against the CDN, which is what we want.
   const shim=URL.createObjectURL(new Blob(
     [`import ${JSON.stringify(abs+'/worker.js')};`],{type:'text/javascript'}));
-  await ff.load({
+  const base = useMT ? FF_BASE.coremt : FF_BASE.core;
+  const cfg={
     classWorkerURL:shim,
-    coreURL:await toBlobURL(FF_BASE.core+'/ffmpeg-core.js','text/javascript'),
-    wasmURL:await toBlobURL(FF_BASE.core+'/ffmpeg-core.wasm','application/wasm'),
-  });
+    coreURL:await toBlobURL(base+'/ffmpeg-core.js','text/javascript'),
+    wasmURL:await toBlobURL(base+'/ffmpeg-core.wasm','application/wasm'),
+  };
+  if(useMT) cfg.workerURL=await toBlobURL(base+'/ffmpeg-core.worker.js','text/javascript');
+  try{
+    await ff.load(cfg);
+  }catch(err){
+    if(!useMT) throw err;
+    console.warn('multi-core build failed, falling back to single core',err);
+    ffIsMT=false;
+    await ff.load({classWorkerURL:shim,
+      coreURL:await toBlobURL(FF_BASE.core+'/ffmpeg-core.js','text/javascript'),
+      wasmURL:await toBlobURL(FF_BASE.core+'/ffmpeg-core.wasm','application/wasm')});
+  }
   ffmpegInst=ff;
   return ff;
 }
