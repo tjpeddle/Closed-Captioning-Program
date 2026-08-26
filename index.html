@@ -186,6 +186,9 @@
         <button id="dlAll" class="ghost" hidden>Download .srt for every finished video</button>
         <button id="dlMp4" class="ghost">Download .mp4 with captions built in</button>
       </div>
+      <div class="bar">
+        <button id="dlPack">⭐ Download share pack (.zip) &mdash; works everywhere</button>
+      </div>
       <div class="hint" id="mp4Status" role="status" aria-live="polite"></div>
       <div class="bar" id="diagWrap" hidden style="margin-top:6px">
         <button id="diagBtn" class="ghost tiny">Copy technical details</button>
@@ -197,7 +200,9 @@
 
   <details>
     <summary>Where to put the caption file</summary>
+    <p><strong>Easiest path:</strong> use <em>Download share pack</em> above. It bundles both caption formats, a ready-made player page, and step-by-step instructions for each platform.</p>
     <ul>
+      <li><strong>Blackboard:</strong> upload the <code>.mp4</code>, then edit the video item and look for &ldquo;Add caption file&rdquo; / &ldquo;Subtitles&rdquo; &rarr; choose the <code>.vtt</code>. If you can&rsquo;t find that option, upload the video, the <code>.vtt</code> and <code>player.html</code> from the share pack into one folder and link students to <code>player.html</code>.</li>
       <li><strong>Canvas Studio:</strong> open the video &rarr; Captions tab &rarr; Upload caption file &rarr; choose the <code>.srt</code>.</li>
       <li><strong>Panopto:</strong> Edit &rarr; Captions &rarr; Upload or import captions.</li>
       <li><strong>YouTube:</strong> Studio &rarr; Subtitles &rarr; the video &rarr; Add &rarr; Upload file &rarr; With timing.</li>
@@ -933,6 +938,153 @@ $('dlAll').addEventListener('click',()=>{
   done.forEach((q,i)=>setTimeout(()=>download(toSRT(q.cues),nameFor(q.file)+'.srt','text/plain'),i*400));
 });
 
+/* ---------- share pack ----------
+   One click, one small ZIP: the captions in both standard formats, a
+   self-contained player page that gives a real CC button on any host, and
+   plain-language instructions per platform. No size limit, no re-encoding —
+   the video itself is not copied into it. */
+const CRC=(()=>{ const t=new Uint32Array(256);
+  for(let i=0;i<256;i++){ let c=i; for(let k=0;k<8;k++) c=c&1?0xEDB88320^(c>>>1):c>>>1; t[i]=c>>>0; }
+  return b=>{ let c=0xFFFFFFFF; for(let i=0;i<b.length;i++) c=t[(c^b[i])&0xFF]^(c>>>8); return (c^0xFFFFFFFF)>>>0; };
+})();
+function zip(files){
+  // minimal store-only ZIP (no compression) — plenty for text files
+  const enc=new TextEncoder(), chunks=[], dir=[]; let off=0;
+  const u16=n=>[n&255,(n>>8)&255], u32=n=>[n&255,(n>>8)&255,(n>>16)&255,(n>>24)&255];
+  // A real MS-DOS date/time: all-zero fields are invalid and Windows Explorer
+  // can refuse to open the archive.
+  const d=new Date();
+  const dTime=((d.getHours()&31)<<11)|((d.getMinutes()&63)<<5)|((d.getSeconds()/2)&31);
+  const dDate=(((d.getFullYear()-1980)&127)<<9)|(((d.getMonth()+1)&15)<<5)|(d.getDate()&31);
+  for(const f of files){
+    const name=enc.encode(f.name);
+    const data=typeof f.data==='string'?enc.encode(f.data):f.data;
+    const crc=CRC(data);
+    const local=[...u32(0x04034b50),...u16(20),...u16(0),...u16(0),...u16(dTime),...u16(dDate),
+                 ...u32(crc),...u32(data.length),...u32(data.length),...u16(name.length),...u16(0)];
+    chunks.push(new Uint8Array(local),name,data);
+    dir.push({name,crc,len:data.length,off});
+    off+=local.length+name.length+data.length;
+  }
+  const cd=[]; let cdLen=0;
+  for(const e of dir){
+    const h=[...u32(0x02014b50),...u16(20),...u16(20),...u16(0),...u16(0),...u16(dTime),...u16(dDate),
+             ...u32(e.crc),...u32(e.len),...u32(e.len),...u16(e.name.length),
+             ...u16(0),...u16(0),...u16(0),...u16(0),...u32(0),...u32(e.off)];
+    cd.push(new Uint8Array(h),e.name);
+    cdLen+=h.length+e.name.length;
+  }
+  cd.push(new Uint8Array([...u32(0x06054b50),...u16(0),...u16(0),...u16(dir.length),...u16(dir.length),
+                          ...u32(cdLen),...u32(off),...u16(0)]));
+  return new Blob([...chunks,...cd],{type:'application/zip'});
+}
+
+function playerPage(videoName,vttName,title){
+  return `<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>${esc(title)}</title>
+<style>
+ body{margin:0;background:#0e1116;color:#e8ecf2;font:16px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif}
+ .wrap{max-width:1000px;margin:0 auto;padding:24px 16px 48px}
+ h1{font-size:1.25rem;margin:0 0 14px}
+ video{width:100%;background:#000;border-radius:10px}
+ video::cue{background:rgba(0,0,0,.8);color:#fff;font-size:1rem}
+ .tip{margin-top:14px;color:#9aa4b2;font-size:.9rem}
+ .pick{margin-top:14px;padding:14px;border:1px solid #2a303a;border-radius:10px;background:#161a21}
+ button,input[type=file]{font:inherit}
+ button{background:#7c3aed;color:#fff;border:0;border-radius:8px;padding:9px 15px;cursor:pointer}
+</style></head><body><div class="wrap">
+<h1>${esc(title)}</h1>
+<video id="v" controls preload="metadata" crossorigin="anonymous">
+  <source src="${esc(videoName)}" type="video/mp4">
+  <track id="t" kind="captions" label="English" srclang="en" src="${esc(vttName)}" default>
+</video>
+<p class="tip">Captions are on by default. Use the <strong>CC</strong> button in the player to turn them off, and your browser's settings to change their size.</p>
+<div class="pick" id="pick" hidden>
+  <strong>Video not found.</strong> Make sure <code>${esc(videoName)}</code> sits in the same folder as this page,
+  or choose the video file here to watch it with captions right now:
+  <p><input type="file" id="f" accept="video/*"></p>
+</div>
+<script>
+ var v=document.getElementById('v');
+ v.addEventListener('error',function(){document.getElementById('pick').hidden=false;},true);
+ document.getElementById('f').addEventListener('change',function(e){
+   var file=e.target.files[0]; if(!file) return;
+   v.src=URL.createObjectURL(file); v.load();
+   var tr=v.textTracks[0]; if(tr) tr.mode='showing';
+   document.getElementById('pick').hidden=true;
+ });
+<\/script>
+</div></body></html>`;
+}
+
+function howTo(base){
+  return `HOW TO PUT THESE CAPTIONS ON YOUR VIDEO
+=======================================
+This folder contains:
+  ${base}.vtt   the caption file most websites want
+  ${base}.srt   the caption file most desktop players want
+  player.html   a ready-made page that plays the video with a CC button
+  ${base}.txt   the plain transcript
+
+Captions made with Caption Studio. Check them before publishing —
+speech recognition makes mistakes, especially with names and technical terms.
+
+BLACKBOARD
+  Option 1 - Blackboard's own video player:
+    Upload your .mp4 to the course, then Edit the video item and look for
+    "Add caption file" / "Subtitles". Choose ${base}.vtt. Students get a CC button.
+  Option 2 - simplest and always works:
+    Upload BOTH the .mp4 and player.html and ${base}.vtt into the same
+    Content area folder, then link students to player.html.
+
+SHARING A LINK (OneDrive, SharePoint, Google Drive, a web server)
+  Put the video, ${base}.vtt and player.html in the same folder and share the
+  link to player.html. The CC button works for anyone who opens it.
+
+PANOPTO / KALTURA / CANVAS STUDIO
+  Open the video, find the Captions tab, upload ${base}.vtt (or .srt).
+
+YOUTUBE
+  Studio > Subtitles > pick the video > Add > Upload file > "With timing" > ${base}.srt
+
+VLC / WINDOWS / MAC (playing the file directly)
+  Keep ${base}.srt next to the video with the SAME name, e.g.
+  ${base}.mp4 and ${base}.srt. VLC then shows captions automatically.
+  Note: Windows Media Player often cannot show captions at all - use VLC.
+
+WHICH SHOULD I USE?
+  If the platform has a place to upload captions, use it - that gives students
+  a proper CC button plus size and position controls, which is what a student
+  who relies on captions needs. player.html is the fallback for when it doesn't.
+`;
+}
+
+$('dlPack').addEventListener('click',()=>{
+  if(!current || !usable().length){
+    mp4Status.textContent='Generate and review captions first, then download the pack.';
+    return;
+  }
+  const base=nameFor(current.file);
+  const files=[
+    {name:base+'.vtt', data:toVTT()},
+    {name:base+'.srt', data:toSRT()},
+    {name:base+'.txt', data:toTXT()},
+    {name:'player.html', data:playerPage(base+'.mp4', base+'.vtt', base)},
+    {name:'HOW-TO-ADD-CAPTIONS.txt', data:howTo(base)},
+  ];
+  const a=document.createElement('a');
+  a.href=URL.createObjectURL(zip(files));
+  a.download=base+'-captions.zip';
+  document.body.appendChild(a); a.click();
+  setTimeout(()=>{URL.revokeObjectURL(a.href);a.remove();},1500);
+  mp4Status.innerHTML='<strong>Share pack downloaded: '+esc(base)+'-captions.zip</strong><br>'+
+    'Unzip it, put your video file in the same folder, and open <strong>HOW-TO-ADD-CAPTIONS.txt</strong> — '+
+    'it tells the instructor exactly what to do in Blackboard, Panopto, YouTube or a shared link. '+
+    'The included <strong>player.html</strong> is the always-works option: video + player.html + .vtt in one folder, share the link to player.html.';
+});
+
 /* ---------- captioned MP4 export ----------
    Repackages the original video into an MP4 with the captions embedded as a
    proper caption track (mov_text) — no re-encoding, so it takes seconds, the
@@ -1144,6 +1296,16 @@ $('dlMp4').addEventListener('click',async ()=>{
     const floor = used.reencoded ? Math.min(f.size*0.05, 1048576) : f.size*0.5;
     if(data.length < floor) throw new Error('remux produced a truncated file');
 
+    // Read the finished file back and confirm the caption track really is in
+    // there. Done after readFile, so even if this probe upsets the runtime we
+    // already hold the bytes.
+    let capsIn=null;
+    try{
+      ffLog.length=0;
+      await ff.exec(['-hide_banner','-i',plan.out]);
+      capsIn=/Subtitle:/i.test(ffLog.join('\n'));
+    }catch(_){}
+
     mp4Status.textContent='Saving the file…';
     const outFile=nameFor(f)+'-captioned'+plan.ext;
     let where;
@@ -1160,10 +1322,14 @@ $('dlMp4').addEventListener('click',async ()=>{
       setTimeout(()=>{URL.revokeObjectURL(a.href);a.remove();},1500);
       where='in your downloads';
     }
-    mp4Status.textContent='Done — '+outFile+' is '+where+
-      (plan.ext==='.mkv'?'. This video’s streams cannot go inside an MP4 without re-encoding, so it is packaged as .mkv — VLC plays it, Windows Media Player may not.':'')+
+    mp4Status.innerHTML='<strong>Done — '+esc(outFile)+' is '+where+'.</strong>'+
+      (capsIn===true?' Verified: the caption track is inside the file ('+usable().length+(usable().length===1?' line':' lines')+').':
+       capsIn===false?' <strong>Warning:</strong> the caption track does not appear to be in the file — please use the .srt instead and tell Joel.':'')+
+      (plan.ext==='.mkv'?' This video’s streams cannot go inside an MP4 without re-encoding, so it is packaged as .mkv — VLC plays it, Windows Media Player may not.':'')+
       (handleDropped?' (It went to your Downloads folder rather than the location you picked, because that was named .mp4 and this file is .mkv.)':'')+
-      ' Captions are on by default in VLC; other players show them under the subtitle or CC menu.';
+      '<br><br><strong>To see the captions:</strong> open it in <strong>VLC</strong> and choose <em>Subtitle → Sub Track → English</em>. '+
+      'Windows Media Player often cannot display captions stored inside an MP4 even when they are there — that is a limitation of the player, not the file. '+
+      'For a student who depends on captions, the <strong>.srt file next to the video</strong> (or uploaded to Canvas) is the more dependable route.';
     try{ await ff.deleteFile('caps.srt'); await ff.deleteFile(plan.out); }catch(_){}
     if(mounted){ try{ await ff.unmount('/src'); }catch(_){} }
     else { try{ await ff.deleteFile(inName); }catch(_){} }
